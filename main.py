@@ -23,13 +23,21 @@ if __name__ == "__main__":
                   (load (input B) (index (tile i))))
                (index (tile i))))
     """
-    
+    example_1d_sloop = """
+    (sloop 0 1024 128 i
+        (store (input C) 
+               (+ (load (input A) (index (tile i))) 
+                  (load (input B) (index (tile i))))
+               (index (tile i))))
+    """
+
+
     # Example 2: Nested parallel loops - 2D grid  
     example_2d_ploop = """
     (ploop 0 64 8 i
         (ploop 0 128 16 j
             (store (input C) 
-                   (+ (load (input A) (index (tile i) (tile j))) 
+                   (- (load (input A) (index (tile i) (tile j))) 
                       (load (input B) (index (tile i) (tile j))))
                    (index (tile i) (tile j)))))
     """
@@ -44,17 +52,60 @@ if __name__ == "__main__":
                    (index (tile i)))))
     """
     
-    print("Example 1 - 1D Parallel Loop (Grid: 8x1):")
-    print("=" * 50)
-    result1 = convert_ir_to_triton(example_1d_ploop, {'A': (1024,), 'B': (1024,), 'C': (1024,)})
-    print(result1)
+    # Example 4: First computation of Attention
+    example_att1 = """
+    (ploop 0 M tile_m m
+        (ploop 0 N tile_n n 
+            (store (input C) 
+                (*
+                    (load (input Q) (index (tile m) (fulltile)))
+                    (load (input K) (index (fulltile) (tile n)))
+                )
+                (index (tile m) (tile n))
+            )
+        )
+    )
+    """
     
-    print("\n\nExample 2 - 2D Parallel Loop (Grid: 8x8):")
-    print("=" * 50)
-    result2 = convert_ir_to_triton(example_2d_ploop, {'A': (64, 128), 'B': (64, 128), 'C': (64, 128)})
-    print(result2)
+    example_matmul = """
+    (ploop 0 M tile_m m
+      (ploop 0 N tile_n n
+          (store (input C)
+              (*
+                  (load (input Q) (index (tile m) (fulltile)))
+                  (load (input K) (index (fulltile) (tile n)))
+              )
+              (index (tile m) (tile n))
+          )
+      )
+    )
+    """
+
+    matmul = convert_ir_to_triton(example_matmul, {'A': (512, 256), 'B': (256, 128), 'C': (512, 128)})
+    with open("create_matmul.py", "w") as f:
+        f.write(matmul)
+
+    # result = convert_ir_to_triton(example_att1, {'Q': (128, 64), 'K': (64, 128), 'C': (128, 128)})
+    # with open("att1.py", "w") as f:
+    #     f.write(result)
+
+    # print("Example 1 - 1D Parallel Loop (Grid: 8x1):")
+    # print("=" * 50)
+    # result1 = convert_ir_to_triton(example_1d_ploop, {'A': (1024,), 'B': (1024,), 'C': (1024,)})
+
+    # with open("ploop_1d.py", "w") as f:
+    #     f.write(result1)
     
-    print("\n\nExample 3 - Mixed Parallel/Sequential:")
-    print("=" * 50)
-    result3 = convert_ir_to_triton(example_mixed, {'A': (64, 128), 'C': (64,)})
-    print(result3)
+    # print("\n\nExample 2 - 2D Parallel Loop (Grid: 8x8):")
+    # print("=" * 50)
+    # result2 = convert_ir_to_triton(example_2d_ploop, {'A': (64, 128), 'B': (64, 128), 'C': (64, 128)})
+
+    # with open("ploop_2d.py", "w") as f:
+    #     f.write(result2)
+    
+    # print("\n\nExample 3 - Mixed Parallel/Sequential:")
+    # print("=" * 50)
+    # result3 = convert_ir_to_triton(example_mixed, {'A': (64, 128), 'C': (64,)})
+
+    # with open("mixed_loop.py", "w") as f:
+    #     f.write(result3)
