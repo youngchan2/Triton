@@ -1,2 +1,6 @@
 __pycache__
 testcase/
+expressions/
+test*
+*.txt
+*kernel.py

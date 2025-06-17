@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 from NodeType import NodeType
 from AstNode import ASTNode
 
@@ -11,11 +11,14 @@ class TritonCodeGen:
         self.temp_counter = 0
         self.indent_level = 0
         self.parallel_dims = []  # Track parallel loop dimensions for grid calculation
+        self.all_loops = []  # Track all loops (parallel and sequential) for BLOCK parameters
         self.program_id_counter = 0
         self.tensors_used = set()
         self.offset_counter = 0  # Counter for offset variables
         self.mask_counter = 0    # Counter for mask variables
         self.loop_var_to_tensor_dim = {}  # loop_var -> (tensor_name, dimension)
+        self.kernel_counter = 0  # Counter for kernel names
+        self.generated_kernels = []  # List of (kernel_name, kernel_code, tensors_used, parallel_dims)
         
     def generate(self, ast: ASTNode, tensor_shapes: Dict[str, Tuple[int, ...]] = None) -> str:
         """Generate Triton kernel code from AST"""
@@ -23,25 +26,216 @@ class TritonCodeGen:
             self.tensor_shapes = tensor_shapes
             
         # Reset state
+        self.kernel_counter = 0
+        self.generated_kernels = []
+        
+        # Check if root is a seq node
+        if ast.node_type == NodeType.SEQ:
+            # Generate separate kernels for each child
+            return self._generate_seq_kernels(ast)
+        else:
+            # Generate single kernel as before
+            return self._generate_single_kernel(ast)
+    
+    def _flatten_seq(self, node: ASTNode):
+        """Recursively flatten nested seq nodes into a list of operations"""
+        if node.node_type == NodeType.SEQ:
+            operations = []
+            for child in node.children:
+                operations.extend(self._flatten_seq(child))
+            return operations
+        else:
+            return [node]
+    
+    def _generate_seq_kernels(self, seq_node: ASTNode) -> str:
+        """Generate separate kernels for each operation in a (possibly nested) seq"""
+        all_code = ""
+        
+        # Generate import statements once
+        all_code += """import triton
+import triton.language as tl
+import torch
+
+"""
+        
+        # Flatten all nested seq nodes
+        operations = self._flatten_seq(seq_node)
+        
+        # Generate a kernel for each operation
+        for i, op in enumerate(operations):
+            kernel_name = f"kernel_{i}"
+            kernel_code = self._generate_single_kernel(op, kernel_name=kernel_name)
+            
+            # Remove the import statements from individual kernels (they're already at the top)
+            kernel_code = kernel_code.replace("import triton\nimport triton.language as tl\nimport torch\n\n", "")
+            
+            all_code += kernel_code + "\n\n"
+            
+            # Store kernel info for wrapper generation
+            self.generated_kernels.append((
+                kernel_name,
+                kernel_code,
+                self.tensors_used.copy(),
+                self.parallel_dims.copy(),
+                self.all_loops.copy()
+            ))
+        
+        # Generate wrapper function
+        all_code += self._generate_wrapper_function()
+        
+        return all_code
+    
+    def _generate_wrapper_function(self) -> str:
+        """Generate a wrapper function that calls all kernels sequentially"""
+        # Collect all unique tensors used across all kernels
+        all_tensors = set()
+        for _, _, tensors_used, _, _ in self.generated_kernels:
+            all_tensors.update(tensors_used)
+        
+        code = "def forward("
+        
+        # Generate parameter list
+        params = []
+        for tensor_name in sorted(all_tensors):
+            params.append(f"{tensor_name}")
+        
+        code += ", ".join(params) + "):\n"
+        code += '    """\n'
+        code += '    Wrapper function that executes all kernels sequentially.\n'
+        code += '    """\n'
+        
+        # Call each kernel
+        for kernel_name, _, tensors_used, parallel_dims, all_loops in self.generated_kernels:
+            # Calculate grid size for this kernel
+            if parallel_dims:
+                grid_parts = []
+                for idx, (loop_var, start, end, tile_size) in enumerate(parallel_dims):
+                    # Try to use tensor dimensions for end values
+                    end_param = end
+                    
+                    # Check if it's a variable like M, N, K
+                    if end in ['M', 'N', 'K'] or (isinstance(end, str) and end.isalpha()):
+                        # Try to infer from tensor shapes
+                        if loop_var in self.loop_var_to_tensor_dim:
+                            tensor_name, dim = self.loop_var_to_tensor_dim[loop_var]
+                            if tensor_name in tensors_used:
+                                end_param = f"{tensor_name}.shape[{dim}]"
+                        
+                        # If still not resolved, use the loop_var_to_tensor_dim mapping
+                        if end_param == end and loop_var in self.loop_var_to_tensor_dim:
+                            tensor_name, dim = self.loop_var_to_tensor_dim[loop_var]
+                            # Find any tensor with the same number of dimensions
+                            for tensor in sorted(tensors_used):
+                                if tensor in self.tensor_shapes:
+                                    shape = self.tensor_shapes[tensor]
+                                    if len(shape) > dim:
+                                        end_param = f"{tensor}.shape[{dim}]"
+                                        break
+                        
+                        # If still not resolved, fall back to heuristic
+                        if end_param == end:  # Still unchanged
+                            # Look for a 2D tensor to get dimensions from
+                            found = False
+                            for tensor in sorted(tensors_used):
+                                if tensor in self.tensor_shapes:
+                                    shape = self.tensor_shapes[tensor]
+                                    if len(shape) >= 2:
+                                        # Try to be smarter: if we have loop_var_to_tensor_dim info, use it
+                                        if loop_var in self.loop_var_to_tensor_dim:
+                                            _, preferred_dim = self.loop_var_to_tensor_dim[loop_var]
+                                            if preferred_dim < len(shape):
+                                                end_param = f"{tensor}.shape[{preferred_dim}]"
+                                                found = True
+                                                break
+                                        # Otherwise fall back to index-based heuristic
+                                        if not found:
+                                            if idx == 0:  # First parallel dimension
+                                                end_param = f"{tensor}.shape[0]"
+                                            elif idx == 1:  # Second parallel dimension
+                                                end_param = f"{tensor}.shape[1]"
+                                            found = True
+                                            break
+                            
+                            # If still not found, try to use any tensor's dimension
+                            if not found:
+                                for tensor in sorted(tensors_used):
+                                    if tensor in self.tensor_shapes:
+                                        shape = self.tensor_shapes[tensor]
+                                        if len(shape) > idx:
+                                            end_param = f"{tensor}.shape[{idx}]"
+                                            break
+                    
+                    # Use the actual tile size from the loop
+                    block_size = tile_size  # Use actual tile size
+                    grid_parts.append(f"({end_param} - {start} + {block_size} - 1) // {block_size}")
+                
+                grid_calc = "(" + ", ".join(grid_parts) + ",)"
+                
+                code += f"    # Launch {kernel_name}\n"
+                code += f"    grid = {grid_calc}\n"
+            else:
+                code += f"    # Launch {kernel_name}\n"
+                code += f"    grid = (1,)\n"
+            
+            # Generate kernel call
+            code += f"    {kernel_name}[grid](\n"
+            
+            # Add parameters for this kernel
+            kernel_params = []
+            for tensor in sorted(tensors_used):
+                # Pointer
+                kernel_params.append(f"        {tensor}")
+                
+                # Shape parameters
+                if tensor in self.tensor_shapes:
+                    num_dims = len(self.tensor_shapes[tensor])
+                else:
+                    num_dims = max(len(parallel_dims), 2)  # Default to 2D
+                
+                for dim in range(num_dims):
+                    kernel_params.append(f"        {tensor}.shape[{dim}]")
+                
+                # Stride parameters
+                for dim in range(num_dims):
+                    kernel_params.append(f"        {tensor}.stride({dim})")
+            
+            # Add block size parameters for all loops
+            for loop_var, _, _, tile_size in all_loops:
+                kernel_params.append(f"        {tile_size}")  # Use actual tile size
+            
+            code += ",\n".join(kernel_params)
+            code += "\n    )\n\n"
+        
+        code += "    # Return output tensors if needed\n"
+        code += "    # This depends on your specific use case\n"
+        code += "    pass\n"
+        
+        return code
+    
+    def _generate_single_kernel(self, ast: ASTNode, kernel_name: str = "kernel") -> str:
+        """Generate a single Triton kernel from AST"""
+        # Reset state for this kernel
         self.parallel_dims = []
+        self.all_loops = []
         self.program_id_counter = 0
         self.tensors_used = set()
         self.temp_counter = 0
         self.offset_counter = 0
         self.mask_counter = 0
         self.loop_var_to_tensor_dim = {}
+        self.loop_vars = {}
         
         # First pass: collect all tensors used in the AST
         self._collect_tensors(ast)
         
-        # Second pass: collect parallel loops to determine BLOCK parameters
-        self._collect_parallel_loops(ast)
+        # Second pass: collect all loops to determine BLOCK parameters
+        self._collect_all_loops(ast)
         
         # Third pass: analyze loop contexts to map loop vars to tensor dimensions
         self._analyze_loop_contexts(ast)
 
         # Generate kernel function
-        kernel_code = self._generate_kernel_header()
+        kernel_code = self._generate_kernel_header(kernel_name)
 
         self.indent_level = 1  # Set initial indent level for kernel body
         kernel_code += self._generate_node(ast)
@@ -74,7 +268,7 @@ class TritonCodeGen:
         
         return grid_calc
     
-    def _generate_kernel_header(self) -> str:
+    def _generate_kernel_header(self, kernel_name: str = "kernel") -> str:
         # Generate Triton kernel function header with shape and stride parameters
         params = []
         for name in sorted(self.tensors_used):
@@ -96,8 +290,8 @@ class TritonCodeGen:
             # Stride parameters
             for dim in range(num_dims):
                 params.append(f"{name}_stride{dim}: tl.constexpr")
-        # block sizes for each parallel loop
-        for loop_var, start, end, tile_size in self.parallel_dims:
+        # block sizes for all loops (parallel and sequential)
+        for loop_var, start, end, tile_size in self.all_loops:
             params.append(f"BLOCK_{loop_var.upper()}: tl.constexpr")
         params_str = ",\n    ".join(params)
         header = f"""import triton
@@ -105,51 +299,11 @@ import triton.language as tl
 import torch
 
 @triton.jit
-def kernel(
+def {kernel_name}(
     {params_str}
 ):
 """
         return header
-
-#     def _generate_kernel_header(self) -> str:
-#         """Generate Triton kernel function header"""
-#         return """import triton
-# import triton.language as tl
-# import torch
-
-# @triton.jit
-# def kernel(
-#     {params_str},
-# ):
-    
-# """
-    
-#     def _generate_launcher(self) -> str:
-#         """Generate kernel launcher function"""
-#         return """def launch_kernel(tensors, grid_size=None, block_size=128):
-#     \"\"\"Launch the generated Triton kernel\"\"\"
-#     # Extract tensor pointers and metadata
-#     tensor_ptrs = {}
-#     shapes_and_strides = {}
-    
-#     for name, tensor in tensors.items():
-#         tensor_ptrs[f'{name}_ptr'] = tensor.data_ptr()
-#         shapes_and_strides[f'{name}_shape'] = tensor.shape
-#         shapes_and_strides[f'{name}_stride'] = tensor.stride()
-    
-#     # Auto-calculate grid size based on parallel dimensions if not provided
-#     if grid_size is None:
-#         # This should be set based on the parallel loops found during code generation
-#         # For now, use a default that works for most cases
-#         grid_size = (1,)
-    
-#     # Launch kernel
-#     kernel[grid_size](
-#         **tensor_ptrs,
-#         **shapes_and_strides,
-#         BLOCK_SIZE=block_size,
-#     )
-# """
     
     def _generate_node(self, node: ASTNode) -> str:
         """Generate code for a single AST node"""
@@ -158,6 +312,8 @@ def kernel(
         elif node.node_type == NodeType.SLOOP:
             return self._generate_sloop(node)
         elif node.node_type == NodeType.SEQ:
+            # If we encounter a nested seq, just generate its children inline
+            # (This shouldn't happen at the top level since we handle that separately)
             return self._generate_seq(node)
         elif node.node_type == NodeType.LOAD:
             return self._generate_load(node)
@@ -177,6 +333,8 @@ def kernel(
             return self._generate_unary_op(node, "tl.exp")
         elif node.node_type == NodeType.RSUM:
             return self._generate_reduce_sum(node)
+        elif node.node_type == NodeType.BCAST:
+            return self._generate_broadcast(node)
         elif node.node_type == NodeType.NUM:
             return str(node.value)
         elif node.node_type == NodeType.VAR:
@@ -258,7 +416,7 @@ def kernel(
         return code
     
     def _generate_seq(self, node: ASTNode) -> str:
-        """Generate sequence of operations"""
+        """Generate sequence of operations (for nested seq nodes only)"""
         code = ""
         for child in node.children:
             code += self._generate_node(child) + "\n"
@@ -456,7 +614,7 @@ def kernel(
             
         # For DNN compiler, use tl.dot with default allow_tf32=True
         # The IR already handles tiling, so we just use tl.dot on the tiles
-        return f"tl.dot({left}, {right})"
+        return f"tl.dot({left}, {right}, allow_tf32=False)"
     
     def _generate_reduce_sum(self, node: ASTNode) -> str:
         """Generate reduce sum operation"""
@@ -471,6 +629,37 @@ def kernel(
             # Generate the child expression
             tensor = self._generate_node(child)
             return f"tl.sum({tensor}, axis={axis})"
+    
+    def _generate_broadcast(self, node: ASTNode) -> str:
+        """Generate broadcast operation
+        
+        The bcast node has two children:
+        1. The tensor to broadcast (usually a load operation)
+        2. The dimension along which to broadcast
+        
+        In Triton, broadcasting a 1D tensor to 2D is done by adding [:, None] or [None, :]
+        depending on the broadcast dimension.
+        """
+        # Get the tensor to broadcast
+        tensor_child = node.children[0]
+        broadcast_dim = int(self._generate_node(node.children[1]))
+        
+        # Check if the child is a load operation with a temp_var
+        if hasattr(tensor_child, 'temp_var'):
+            tensor_expr = tensor_child.temp_var
+        else:
+            tensor_expr = self._generate_node(tensor_child)
+        
+        # In Triton, to broadcast:
+        # - Along dimension 0 (rows): use [None, :]
+        # - Along dimension 1 (columns): use [:, None]
+        if broadcast_dim == 0:
+            return f"{tensor_expr}[None, :]"
+        elif broadcast_dim == 1:
+            return f"{tensor_expr}[:, None]"
+        else:
+            # For higher dimensions, we'd need more complex indexing
+            raise NotImplementedError(f"Broadcast along dimension {broadcast_dim} not yet implemented")
     
     def _indent(self, code: str) -> str:
         """Add indentation to code"""
@@ -538,8 +727,8 @@ def kernel(
                     if loop_var not in self.loop_var_to_tensor_dim:
                         self.loop_var_to_tensor_dim[loop_var] = (tensor_name, dim)
     
-    def _collect_parallel_loops(self, node: ASTNode):
-        """Collect parallel loop information for BLOCK parameters"""
+    def _collect_all_loops(self, node: ASTNode):
+        """Collect all loop information for BLOCK parameters"""
         if node.node_type == NodeType.PLOOP:
             # Extract loop info: (ploop start end tile_size loop_var body)
             start = node.children[0].value if node.children[0].node_type == NodeType.NUM else "0"
@@ -547,30 +736,42 @@ def kernel(
             tile_size = node.children[2].value if node.children[2].node_type == NodeType.NUM else "BLOCK"
             loop_var = node.children[3].value
             
-            # Add to parallel dimensions
-            self.parallel_dims.append((loop_var, str(start), str(end), str(tile_size)))
+            # Check if this loop variable already exists in parallel_dims
+            loop_var_exists = any(lv == loop_var for lv, _, _, _ in self.parallel_dims)
+            
+            # Only add if not already present
+            if not loop_var_exists:
+                self.parallel_dims.append((loop_var, str(start), str(end), str(tile_size)))
+            
+            # Also add to all_loops if not already present
+            all_loop_exists = any(lv == loop_var for lv, _, _, _ in self.all_loops)
+            if not all_loop_exists:
+                self.all_loops.append((loop_var, str(start), str(end), str(tile_size)))
             
             # Continue collecting in body
             if len(node.children) > 4:
-                self._collect_parallel_loops(node.children[4])
+                self._collect_all_loops(node.children[4])
         elif node.node_type == NodeType.SLOOP:
-            # Also collect sequential loops for BLOCK parameters
+            # Sequential loops are NOT parallel - don't add them to parallel_dims
+            # But add to all_loops for BLOCK parameters
             start = node.children[0].value if node.children[0].node_type == NodeType.NUM else "0"
             end = node.children[1].value if node.children[1].node_type == NodeType.NUM else "N"
             tile_size = node.children[2].value if node.children[2].node_type == NodeType.NUM else "BLOCK"
             loop_var = node.children[3].value
             
-            # Add to parallel dimensions (will be used for BLOCK parameters)
-            self.parallel_dims.append((loop_var, str(start), str(end), str(tile_size)))
+            # Add to all_loops if not already present
+            all_loop_exists = any(lv == loop_var for lv, _, _, _ in self.all_loops)
+            if not all_loop_exists:
+                self.all_loops.append((loop_var, str(start), str(end), str(tile_size)))
             
             # Continue collecting in body
             if len(node.children) > 4:
-                self._collect_parallel_loops(node.children[4])
+                self._collect_all_loops(node.children[4])
         else:
             # Recursively collect from children
             for child in node.children:
                 if isinstance(child, ASTNode):
-                    self._collect_parallel_loops(child)
+                    self._collect_all_loops(child)
     
     def _contains_loads(self, node: ASTNode) -> bool:
         """Check if node contains load operations"""
@@ -618,5 +819,8 @@ def kernel(
             else:
                 child_expr = self._generate_node_without_loads(child)
                 return f"tl.sum({child_expr}, axis={axis})"
+        elif node.node_type == NodeType.BCAST:
+            # Handle broadcast specially
+            return self._generate_broadcast(node)
         else:
             return self._generate_node(node)
