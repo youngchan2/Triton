@@ -4,8 +4,10 @@ class NodeType(Enum):
     PLOOP = "ploop"  # Parallel loop
     SLOOP = "sloop"  # Sequential loop
     INPUT = "input"
+    OUTPUT = "output"
     TILE = "tile"
     FULLTILE = "fulltile"
+    DUMMY = "dummy"
     INDEX = "index"
     LOAD = "load"
     STORE = "store"
@@ -21,3 +23,7 @@ class NodeType(Enum):
     BCAST = "bcast"
     NUM = "num"
     VAR = "var"
+    ELEM = "elem"  # Element-wise indexing
+    PERMUTE3 = "permute3"  # 3D permutation
+    SQUEEZE = "squeeze"  # Remove dimension
+    UNSQUEEZE = "unsqueeze"  # Add dimension

@@ -38,7 +38,14 @@ class IRParser:
             return ASTNode(NodeType.NUM, [], int(token))
         else:
             self.pos += 1
-            return ASTNode(NodeType.VAR, [], token)
+            # Special case: treat 'fulltile' as FULLTILE node even without parentheses
+            if token == 'fulltile':
+                return ASTNode(NodeType.FULLTILE, [])
+            # Special case: treat 'dummy' as DUMMY node even without parentheses
+            elif token == 'dummy':
+                return ASTNode(NodeType.DUMMY, [])
+            else:
+                return ASTNode(NodeType.VAR, [], token)
     
     def parse_list(self) -> ASTNode:
         """Parse a list expression starting with '('"""
@@ -64,6 +71,7 @@ class IRParser:
             'ploop': NodeType.PLOOP,
             'sloop': NodeType.SLOOP,
             'input': NodeType.INPUT,
+            'output': NodeType.OUTPUT,
             'tile': NodeType.TILE,
             'fulltile': NodeType.FULLTILE,
             'index': NodeType.INDEX,
@@ -79,6 +87,11 @@ class IRParser:
             'rsum': NodeType.RSUM,
             'concat': NodeType.CONCAT,
             'bcast': NodeType.BCAST,
+            'dummy': NodeType.DUMMY,
+            'elem': NodeType.ELEM,
+            'permute3': NodeType.PERMUTE3,
+            'squeeze': NodeType.SQUEEZE,
+            'unsqueeze': NodeType.UNSQUEEZE,
         }
         
         if op in node_type_map:
