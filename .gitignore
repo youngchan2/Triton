@@ -4,4 +4,6 @@ expressions/
 test*
 case*
 *.txt
-*kernel.py
+*kernel*
+convert*
+attac*

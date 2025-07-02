@@ -27,3 +27,4 @@ class NodeType(Enum):
     PERMUTE3 = "permute3"  # 3D permutation
     SQUEEZE = "squeeze"  # Remove dimension
     UNSQUEEZE = "unsqueeze"  # Add dimension
+    CONST_TILE = "const_tile"  # Constant range tile [start:start+size]

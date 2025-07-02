@@ -92,6 +92,7 @@ class IRParser:
             'permute3': NodeType.PERMUTE3,
             'squeeze': NodeType.SQUEEZE,
             'unsqueeze': NodeType.UNSQUEEZE,
+            'const_tile': NodeType.CONST_TILE,
         }
         
         if op in node_type_map:

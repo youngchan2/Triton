@@ -15,10 +15,12 @@ class TritonCodeGen:
         self.program_id_counter = 0
         self.tensors_used = set()
         self.offset_counter = 0  # Counter for offset variables
-        self.mask_counter = 0    # Counter for mask variables
         self.loop_var_to_tensor_dim = {}  # loop_var -> (tensor_name, dimension)
         self.kernel_counter = 0  # Counter for kernel names
+        self.intermediate_tensors = set()  # Track intermediate tensors (input tensors used in store)
         self.generated_kernels = []  # List of (kernel_name, kernel_code, tensors_used, parallel_dims)
+        self.cross_kernel_tensors = set()  # Track tensors that cross kernel boundaries
+        self.stored_tensor_dims = {}  # Track which tensors are stored in parallel loops: loop_var -> [(tensor, dim)]
         
     def generate(self, ast: ASTNode, tensor_shapes: Dict[str, Tuple[int, ...]] = None) -> str:
         """Generate Triton kernel code from AST"""
@@ -28,14 +30,48 @@ class TritonCodeGen:
         # Reset state
         self.kernel_counter = 0
         self.generated_kernels = []
+        self.cross_kernel_tensors = set()
         
         # Check if root is a seq node
         if ast.node_type == NodeType.SEQ:
+            # First, identify cross-kernel tensors
+            self._identify_cross_kernel_tensors(ast)
             # Generate separate kernels for each child
             return self._generate_seq_kernels(ast)
         else:
-            # Generate single kernel as before
-            return self._generate_single_kernel(ast)
+            # Generate single kernel with wrapper function
+            all_code = ""
+            
+            # Generate import statements once
+            all_code += """import triton
+import triton.language as tl
+import torch
+
+"""
+            
+            # Generate the single kernel
+            kernel_name = "kernel_0"
+            kernel_code = self._generate_single_kernel(ast, kernel_name=kernel_name)
+            
+            # Remove the import statements from kernel (they're already at the top)
+            kernel_code = kernel_code.replace("import triton\nimport triton.language as tl\nimport torch\n\n", "")
+            
+            all_code += kernel_code + "\n\n"
+            
+            # Store kernel info for wrapper generation
+            self.generated_kernels.append((
+                kernel_name,
+                kernel_code,
+                self.tensors_used.copy(),
+                self.parallel_dims.copy(),
+                self.all_loops.copy(),
+                self.stored_tensor_dims.copy()
+            ))
+            
+            # Generate wrapper function
+            all_code += self._generate_wrapper_function()
+            
+            return all_code
     
     def _has_only_dummy(self, node: ASTNode) -> bool:
         """Check if a node contains only dummy operations"""
@@ -98,7 +134,8 @@ import torch
                 kernel_code,
                 self.tensors_used.copy(),
                 self.parallel_dims.copy(),
-                self.all_loops.copy()
+                self.all_loops.copy(),
+                self.stored_tensor_dims.copy()
             ))
         
         # Generate wrapper function
@@ -113,7 +150,7 @@ import torch
         # Collect all unique block parameters needed
         all_block_params = set()
         
-        for _, _, tensors_used, _, all_loops in self.generated_kernels:
+        for _, _, tensors_used, _, all_loops, _ in self.generated_kernels:
             all_tensors.update(tensors_used)
             # Collect block parameters from loops
             for loop_var, _, _, tile_size in all_loops:
@@ -139,7 +176,7 @@ import torch
         code += '    """\n'
         
         # Call each kernel
-        for kernel_name, _, tensors_used, parallel_dims, all_loops in self.generated_kernels:
+        for kernel_name, _, tensors_used, parallel_dims, all_loops, stored_tensor_dims in self.generated_kernels:
             # Calculate grid size for this kernel
             if parallel_dims:
                 grid_parts = []
@@ -149,22 +186,29 @@ import torch
                     
                     # Check if it's a variable like M, N, K
                     if end in ['M', 'N', 'K'] or (isinstance(end, str) and end.isalpha()):
-                        # Try to infer from tensor shapes
-                        if loop_var in self.loop_var_to_tensor_dim:
+                        # First, check stored_tensor_dims for tensors stored with this loop var
+                        if loop_var in stored_tensor_dims:
+                            # Find the tensor with the largest dimension that uses this loop var
+                            max_size = 0
+                            best_tensor = None
+                            best_dim = None
+                            
+                            for tensor_name, dim in stored_tensor_dims[loop_var]:
+                                if tensor_name in tensors_used and tensor_name in self.tensor_shapes:
+                                    shape = self.tensor_shapes[tensor_name]
+                                    if dim < len(shape) and shape[dim] > max_size:
+                                        max_size = shape[dim]
+                                        best_tensor = tensor_name
+                                        best_dim = dim
+                            
+                            if best_tensor:
+                                end_param = f"{best_tensor}.shape[{best_dim}]"
+                        
+                        # If not found in stored_tensor_dims, try loop_var_to_tensor_dim
+                        if end_param == end and loop_var in self.loop_var_to_tensor_dim:
                             tensor_name, dim = self.loop_var_to_tensor_dim[loop_var]
                             if tensor_name in tensors_used:
                                 end_param = f"{tensor_name}.shape[{dim}]"
-                        
-                        # If still not resolved, use the loop_var_to_tensor_dim mapping
-                        if end_param == end and loop_var in self.loop_var_to_tensor_dim:
-                            tensor_name, dim = self.loop_var_to_tensor_dim[loop_var]
-                            # Find any tensor with the same number of dimensions
-                            for tensor in sorted(tensors_used):
-                                if tensor in self.tensor_shapes:
-                                    shape = self.tensor_shapes[tensor]
-                                    if len(shape) > dim:
-                                        end_param = f"{tensor}.shape[{dim}]"
-                                        break
                         
                         # If still not resolved, fall back to heuristic
                         if end_param == end:  # Still unchanged
@@ -174,21 +218,12 @@ import torch
                                 if tensor in self.tensor_shapes:
                                     shape = self.tensor_shapes[tensor]
                                     if len(shape) >= 2:
-                                        # Try to be smarter: if we have loop_var_to_tensor_dim info, use it
-                                        if loop_var in self.loop_var_to_tensor_dim:
-                                            _, preferred_dim = self.loop_var_to_tensor_dim[loop_var]
-                                            if preferred_dim < len(shape):
-                                                end_param = f"{tensor}.shape[{preferred_dim}]"
-                                                found = True
-                                                break
-                                        # Otherwise fall back to index-based heuristic
-                                        if not found:
-                                            if idx == 0:  # First parallel dimension
-                                                end_param = f"{tensor}.shape[0]"
-                                            elif idx == 1:  # Second parallel dimension
-                                                end_param = f"{tensor}.shape[1]"
-                                            found = True
-                                            break
+                                        if idx == 0:  # First parallel dimension
+                                            end_param = f"{tensor}.shape[0]"
+                                        elif idx == 1:  # Second parallel dimension
+                                            end_param = f"{tensor}.shape[1]"
+                                        found = True
+                                        break
                             
                             # If still not found, try to use any tensor's dimension
                             if not found:
@@ -221,7 +256,10 @@ import torch
             
             # Add parameters for this kernel
             kernel_params = []
-            for tensor in sorted(tensors_used):
+            
+            # First, add parameters for non-intermediate tensors (in sorted order)
+            non_intermediate_tensors = sorted([t for t in tensors_used if t not in self.intermediate_tensors or t in self.cross_kernel_tensors])
+            for tensor in non_intermediate_tensors:
                 # Pointer
                 kernel_params.append(f"        {tensor}")
                 
@@ -237,6 +275,18 @@ import torch
                 # Stride parameters
                 for dim in range(num_dims):
                     kernel_params.append(f"        {tensor}.stride({dim})")
+            
+            # Then, add shape parameters for local intermediate tensors (in sorted order)
+            local_intermediates = sorted([t for t in tensors_used if t in self.intermediate_tensors and t not in self.cross_kernel_tensors])
+            for tensor in local_intermediates:
+                # Only shape parameters for local intermediate tensors
+                if tensor in self.tensor_shapes:
+                    num_dims = len(self.tensor_shapes[tensor])
+                else:
+                    num_dims = 2  # Default to 2D
+                
+                for dim in range(num_dims):
+                    kernel_params.append(f"        {tensor}.shape[{dim}]")
             
             # Add block size parameters for all loops
             for loop_var, _, _, tile_size in all_loops:
@@ -265,23 +315,33 @@ import torch
         self.tensors_used = set()
         self.temp_counter = 0
         self.offset_counter = 0
-        self.mask_counter = 0
         self.loop_var_to_tensor_dim = {}
         self.loop_vars = {}
+        self.stored_tensor_dims = {}
         
         # First pass: collect all tensors used in the AST
         self._collect_tensors(ast)
         
-        # Second pass: collect all loops to determine BLOCK parameters
+        # Second pass: collect intermediate tensors (input tensors in store operations)
+        self._collect_intermediate_tensors(ast)
+        
+        # Third pass: collect all loops to determine BLOCK parameters
         self._collect_all_loops(ast)
         
-        # Third pass: analyze loop contexts to map loop vars to tensor dimensions
+        # Fourth pass: analyze loop contexts to map loop vars to tensor dimensions
         self._analyze_loop_contexts(ast)
+        
+        # Fifth pass: analyze which tensors are stored in parallel loops
+        self._analyze_parallel_store_dims(ast)
 
         # Generate kernel function
         kernel_code = self._generate_kernel_header(kernel_name)
 
         self.indent_level = 1  # Set initial indent level for kernel body
+        
+        # Generate intermediate tensor allocations
+        kernel_code += self._generate_intermediate_allocations(ast)
+        
         kernel_code += self._generate_node(ast)
         self.indent_level = 0  # Reset indent level
         
@@ -296,6 +356,246 @@ import torch
         for child in node.children:
             if isinstance(child, ASTNode):
                 self._collect_tensors(child)
+    
+    def _collect_intermediate_tensors(self, node: ASTNode):
+        """Collect intermediate tensors (input tensors used in store operations)"""
+        if node.node_type == NodeType.STORE:
+            tensor_node = node.children[0]
+            if tensor_node.node_type == NodeType.INPUT:
+                tensor_name = tensor_node.children[0].value
+                self.intermediate_tensors.add(tensor_name)
+        
+        for child in node.children:
+            if isinstance(child, ASTNode):
+                self._collect_intermediate_tensors(child)
+    
+    def _identify_cross_kernel_tensors(self, seq_node: ASTNode):
+        """Identify tensors that cross kernel boundaries in seq operations"""
+        if seq_node.node_type != NodeType.SEQ:
+            return
+        
+        # Flatten nested seq nodes to get all operations
+        operations = self._flatten_seq(seq_node)
+        
+        # Track tensor writes and reads per kernel
+        tensor_writes = {}  # tensor -> kernel_id where it's written
+        tensor_reads = {}   # tensor -> set of kernel_ids where it's read
+        
+        # Analyze each kernel (operation)
+        for kernel_id, op in enumerate(operations):
+            # Collect tensor usage in this kernel
+            writes_in_kernel = set()
+            reads_in_kernel = set()
+            self._collect_tensor_usage(op, writes_in_kernel, reads_in_kernel)
+            
+            # Update global tracking
+            for tensor in writes_in_kernel:
+                tensor_writes[tensor] = kernel_id
+            
+            for tensor in reads_in_kernel:
+                if tensor not in tensor_reads:
+                    tensor_reads[tensor] = set()
+                tensor_reads[tensor].add(kernel_id)
+        
+        # Identify cross-kernel tensors
+        for tensor, write_kernel in tensor_writes.items():
+            if tensor in tensor_reads:
+                for read_kernel in tensor_reads[tensor]:
+                    if write_kernel != read_kernel:
+                        # This tensor is written in one kernel and read in another
+                        self.cross_kernel_tensors.add(tensor)
+                        break
+    
+    def _collect_tensor_usage(self, node: ASTNode, writes: set, reads: set):
+        """Collect tensor reads and writes in a node"""
+        if node.node_type == NodeType.STORE:
+            tensor_node = node.children[0]
+            if tensor_node.node_type == NodeType.INPUT:
+                tensor_name = tensor_node.children[0].value
+                writes.add(tensor_name)
+            # Also check for reads in the value expression
+            if len(node.children) > 1:
+                self._collect_tensor_usage(node.children[1], writes, reads)
+        elif node.node_type == NodeType.LOAD:
+            tensor_node = node.children[0]
+            if tensor_node.node_type == NodeType.INPUT:
+                tensor_name = tensor_node.children[0].value
+                reads.add(tensor_name)
+        else:
+            # Recursively check children
+            for child in node.children:
+                if isinstance(child, ASTNode):
+                    self._collect_tensor_usage(child, writes, reads)
+    
+    def _analyze_parallel_store_dims(self, node: ASTNode, current_ploop_var: str = None):
+        """Analyze which tensors are stored in parallel loops and track their dimensions"""
+        if node.node_type == NodeType.PLOOP:
+            # Extract ploop variable
+            loop_var = node.children[3].value
+            # Recursively analyze body with this ploop variable
+            body = node.children[4]
+            self._analyze_parallel_store_dims(body, loop_var)
+        elif node.node_type == NodeType.STORE and current_ploop_var:
+            # Found a store inside a ploop
+            tensor_node = node.children[0]
+            if tensor_node.node_type == NodeType.INPUT:
+                tensor_name = tensor_node.children[0].value
+                # Analyze the index to find which dimension uses the ploop variable
+                if len(node.children) >= 3:
+                    index_node = node.children[2]
+                    dims_using_ploop = self._find_dims_using_loop_var(index_node, current_ploop_var)
+                    
+                    if current_ploop_var not in self.stored_tensor_dims:
+                        self.stored_tensor_dims[current_ploop_var] = []
+                    
+                    for dim in dims_using_ploop:
+                        self.stored_tensor_dims[current_ploop_var].append((tensor_name, dim))
+        else:
+            # Recursively analyze children
+            for child in node.children:
+                if isinstance(child, ASTNode):
+                    self._analyze_parallel_store_dims(child, current_ploop_var)
+    
+    def _find_dims_using_loop_var(self, index_node: ASTNode, loop_var: str, current_dim: int = 0) -> List[int]:
+        """Find which dimensions in an index expression use the given loop variable"""
+        dims = []
+        
+        if index_node.node_type == NodeType.INDEX:
+            # Process each dimension
+            for i, child in enumerate(index_node.children):
+                if self._index_uses_loop_var(child, loop_var):
+                    dims.append(i)
+        
+        return dims
+    
+    def _index_uses_loop_var(self, node: ASTNode, loop_var: str) -> bool:
+        """Check if an index expression uses the given loop variable"""
+        if node.node_type == NodeType.TILE:
+            # (tile loop_var)
+            if node.children and node.children[0].value == loop_var:
+                return True
+        elif node.node_type == NodeType.ELEM:
+            # (elem loop_var)
+            if node.children and node.children[0].value == loop_var:
+                return True
+        
+        # Recursively check children
+        for child in node.children:
+            if isinstance(child, ASTNode):
+                if self._index_uses_loop_var(child, loop_var):
+                    return True
+        
+        return False
+    
+    def _identify_accumulators(self, ast: ASTNode) -> set:
+        """Identify which intermediate tensors are accumulators"""
+        accumulators = set()
+        
+        def analyze_store(node: ASTNode, in_sloop: bool = False):
+            """Check if a store operation is an accumulation"""
+            if node.node_type == NodeType.STORE and len(node.children) >= 2:
+                # Get the tensor being stored to
+                tensor_node = node.children[0]
+                if tensor_node.node_type == NodeType.INPUT:
+                    tensor_name = tensor_node.children[0].value
+                    
+                    # Check if this tensor is intermediate
+                    if tensor_name in self.intermediate_tensors:
+                        # If store is inside sloop, initialize with zeros
+                        if in_sloop:
+                            accumulators.add(tensor_name)
+                        # Check if the expression being stored involves reading the same tensor
+                        elif self._expression_contains_tensor(node.children[1], tensor_name):
+                            # Check if it's an addition pattern
+                            if self._is_accumulation_pattern(node.children[1], tensor_name):
+                                accumulators.add(tensor_name)
+        
+        def traverse(node: ASTNode, in_sloop: bool = False):
+            """Traverse AST to find all store operations"""
+            if node.node_type == NodeType.STORE:
+                analyze_store(node, in_sloop)
+            elif node.node_type == NodeType.SLOOP:
+                # Mark that we're inside an sloop for child nodes
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        traverse(child, in_sloop=True)
+            elif node.node_type in [NodeType.SEQ, NodeType.PLOOP]:
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        traverse(child, in_sloop)
+        
+        traverse(ast)
+        return accumulators
+    
+    def _expression_contains_tensor(self, expr: ASTNode, tensor_name: str) -> bool:
+        """Check if an expression contains a load of the given tensor"""
+        if expr.node_type == NodeType.LOAD:
+            tensor_node = expr.children[0]
+            if tensor_node.node_type == NodeType.INPUT:
+                return tensor_node.children[0].value == tensor_name
+        
+        # Recursively check children
+        for child in expr.children:
+            if isinstance(child, ASTNode):
+                if self._expression_contains_tensor(child, tensor_name):
+                    return True
+        return False
+    
+    def _is_accumulation_pattern(self, expr: ASTNode, tensor_name: str) -> bool:
+        """Check if expression is an accumulation pattern (addition involving the tensor)"""
+        if expr.node_type == NodeType.ADD:
+            # Check if any operand loads the tensor
+            for child in expr.children:
+                if isinstance(child, ASTNode):
+                    if self._expression_contains_tensor(child, tensor_name):
+                        return True
+        
+        # Also check for patterns like (+ (x factor (load tensor)) result)
+        for child in expr.children:
+            if isinstance(child, ASTNode):
+                if self._is_accumulation_pattern(child, tensor_name):
+                    return True
+        
+        return False
+    
+    def _generate_intermediate_allocations(self, ast: ASTNode = None) -> str:
+        """Generate tl.zeros allocations for intermediate tensors"""
+        # Only allocate intermediate tensors that are NOT cross-kernel tensors
+        local_intermediates = self.intermediate_tensors - self.cross_kernel_tensors
+        
+        if not local_intermediates:
+            return ""
+        
+        # Identify which tensors are accumulators
+        accumulators = set()
+        if ast:
+            accumulators = self._identify_accumulators(ast)
+        
+        code = "    # Allocate intermediate tensors\n"
+        for tensor_name in sorted(local_intermediates):
+            if tensor_name in self.tensor_shapes:
+                shape = self.tensor_shapes[tensor_name]
+                # Build shape string using dimension parameters
+                shape_params = []
+                for i in range(len(shape)):
+                    shape_params.append(f"{tensor_name}_dim{i}")
+                shape_str = f"({', '.join(shape_params)})"
+                
+                # Only initialize with zeros if it's an accumulator
+                if tensor_name in accumulators:
+                    code += f"    {tensor_name} = tl.zeros({shape_str}, dtype=tl.float32)\n"
+                else:
+                    # For non-accumulator tensors, just comment that they'll be assigned
+                    code += f"    # {tensor_name} will be assigned without initialization\n"
+            # else:
+            #     # If shape not provided, default to 2D
+            #     if tensor_name in accumulators:
+            #         code += f"    {tensor_name} = tl.zeros(({tensor_name}_dim0, {tensor_name}_dim1), dtype=tl.float32)\n"
+            #     else:
+            #         code += f"    # {tensor_name} will be assigned without initialization\n"
+        
+        code += "\n"
+        return code
 
     def _calculate_grid_size(self) -> str:
         """Calculate grid size based on parallel dimensions"""
@@ -316,6 +616,10 @@ import torch
         # Generate Triton kernel function header with shape and stride parameters
         params = []
         for name in sorted(self.tensors_used):
+            # Skip intermediate tensors that are NOT cross-kernel tensors
+            if name in self.intermediate_tensors and name not in self.cross_kernel_tensors:
+                continue
+                
             # pointer
             params.append(f"{name}_ptr")
             
@@ -334,6 +638,19 @@ import torch
             # Stride parameters
             for dim in range(num_dims):
                 params.append(f"{name}_stride{dim}: tl.constexpr")
+        
+        # Add shape parameters for local intermediate tensors (but not pointers/strides)
+        local_intermediates = self.intermediate_tensors - self.cross_kernel_tensors
+        for name in sorted(local_intermediates):
+            if self.tensor_shapes and name in self.tensor_shapes:
+                num_dims = len(self.tensor_shapes[name])
+            else:
+                num_dims = 2  # default
+            
+            # Only shape parameters for local intermediate tensors
+            for dim in range(num_dims):
+                params.append(f"{name}_dim{dim}: tl.constexpr")
+        
         # block sizes for all loops (parallel and sequential)
         for loop_var, start, end, tile_size in self.all_loops:
             params.append(f"BLOCK_{loop_var.upper()}: tl.constexpr")
@@ -469,16 +786,19 @@ def {kernel_name}(
         # Determine the end value - use tensor dimension parameter if available
         end_param = self._get_end_param(loop_var, end)
         
-        code = f"""{indent}# Parallel loop {loop_var} from {start} to {end_param} with tile size {block_param}
-{indent}# Executed across grid dimension {grid_dim}
-{indent}{loop_var} = {start} + tl.program_id({grid_dim}) * {block_param}
-{indent}
-{indent}# Boundary check for parallel execution
-{indent}if {loop_var} < {end_param}:
-"""
-        self.indent_level += 1
-        code += self._generate_node(body)
-        self.indent_level -= 1
+        code = f"{indent}# Parallel loop {loop_var} from {start} to {end_param} with tile size {block_param}\n"
+        code += f"{indent}# Executed across grid dimension {grid_dim}\n"
+        code += f"{indent}{loop_var} = {start} + tl.program_id({grid_dim}) * {block_param}\n"
+        code += f"{indent}\n"
+        # Generate body without boundary check
+        body_code = self._generate_node(body)
+        # Remove any leading/trailing newlines from body to avoid double newlines
+        body_code = body_code.strip('\n')
+        if body_code:
+            code += body_code + '\n'
+        else:
+            # Empty body
+            code += f"{indent}pass\n"
         
         return code
     
@@ -503,14 +823,20 @@ def {kernel_name}(
         # Use BLOCK_SIZE parameter instead of hardcoded tile_size
         block_param = f"BLOCK_{loop_var.upper()}"
         
-        # Determine the end value - use tensor dimension parameter if available
-        end_param = self._get_end_param(loop_var, end)
+        # For sloop, use the end value directly (whether it's a number or variable)
+        end_param = end
         
-        code = f"""{indent}# Sequential loop {loop_var} from {start} to {end_param} with tile size {block_param}
-{indent}for {loop_var} in range({start}, {end_param}, {block_param}):
-"""
+        code = f"{indent}# Sequential loop {loop_var} from {start} to {end_param} with tile size {block_param}\n"
+        code += f"{indent}for {loop_var} in range({start}, {end_param}, {block_param}):\n"
         self.indent_level += 1
-        code += self._generate_node(body)
+        body_code = self._generate_node(body)
+        # Remove any leading/trailing newlines from body to avoid double newlines
+        body_code = body_code.strip('\n')
+        if body_code:
+            code += body_code + '\n'
+        else:
+            # Empty body
+            code += f"{indent}    pass\n"
         self.indent_level -= 1
         
         return code
@@ -522,7 +848,12 @@ def {kernel_name}(
             # Skip dummy nodes in sequences
             if child.node_type == NodeType.DUMMY:
                 continue
-            code += self._generate_node(child) + "\n"
+            child_code = self._generate_node(child)
+            if child_code:  # Only add if there's actual code
+                code += child_code
+                # Only add newline if the code doesn't already end with one
+                if not child_code.endswith('\n'):
+                    code += '\n'
         return code
     
     def _generate_load(self, node: ASTNode) -> str:
@@ -532,26 +863,42 @@ def {kernel_name}(
         index_node = node.children[1]
         
         tensor_name = tensor_node.children[0].value
-        offset_expr, mask_expr = self._generate_index(index_node, tensor_name)
         
-        # Generate unique variable names for offset and mask
+        # Check if this is a local intermediate tensor (not cross-kernel)
+        if tensor_name in self.intermediate_tensors and tensor_name not in self.cross_kernel_tensors:
+            # For local intermediate tensors, directly reference without reshape
+            # tl.dot can handle 3D tensors with batch dimension
+            node.temp_var = tensor_name
+            return ""
+        
+        # For input/output tensors and cross-kernel tensors, use normal load operation
+        offset_expr = self._generate_index(index_node, tensor_name)
+        
+        # Generate unique variable names for offset
         offset_var = f"offset_{self.offset_counter}"
-        mask_var = f"mask_{self.mask_counter}"
         self.offset_counter += 1
-        self.mask_counter += 1
         
-        temp_var = f"temp_{self.temp_counter}"
+        # Use temp_{counter} for safer variable naming
+        var_name = f"temp_{self.temp_counter}"
         self.temp_counter += 1
         
-        # Store the temp variable mapping for later use
-        node.temp_var = temp_var
+        # Store the variable mapping for later use
+        node.temp_var = var_name
         
-        # Generate code with separate offset and mask variables
+        # Generate code with separate offset variable
         # Use proper indentation based on current context
         indent_str = '    ' * self.indent_level
         code = f"{indent_str}{offset_var} = {offset_expr}\n"
-        code += f"{indent_str}{mask_var} = {mask_expr}\n"
-        code += f"{indent_str}{temp_var} = tl.load({tensor_name}_ptr + {offset_var}, mask={mask_var}, other=0.0)"
+        code += f"{indent_str}{var_name} = tl.load({tensor_name}_ptr + {offset_var})"
+        
+        # Check if we need to expand_dims when first index is elem
+        # This happens when loading from 3D tensor with elem indexing on first dimension
+        index_types = [child.node_type for child in index_node.children]
+        if (len(index_types) == 3 and index_types[0] == NodeType.ELEM and
+            tensor_name in self.tensor_shapes and len(self.tensor_shapes[tensor_name]) == 3):
+            # The load returns 2D but we need 3D for operations like permute3
+            # Add expand_dims(0) to restore the batch dimension
+            code += f".expand_dims(0)"
         
         return code
     
@@ -563,12 +910,101 @@ def {kernel_name}(
         index_node = node.children[2]
         
         tensor_name = tensor_node.children[0].value
+        tensor_type = tensor_node.node_type
         
         # First generate any load operations in the value expression
         code = ""
         
-        # Handle the value expression generation
-        if self._contains_loads(val_node) or self._contains_reduce_sum(val_node):
+        # Check if value is a simple transformation operation (permute, squeeze, unsqueeze)
+        # that we can generate inline without temp variable
+        if val_node.node_type in [NodeType.PERMUTE3, NodeType.SQUEEZE, NodeType.UNSQUEEZE]:
+            # For these operations, generate them inline and assign directly to target tensor
+            if val_node.node_type == NodeType.PERMUTE3:
+                child = val_node.children[0]
+                # Generate child if needed
+                if child.node_type == NodeType.LOAD and not hasattr(child, 'temp_var'):
+                    code += self._generate_node(child) + "\n"
+                
+                # Get tensor expression
+                tensor_expr = child.temp_var if hasattr(child, 'temp_var') else self._generate_node(child)
+                
+                # Get permutation dimensions
+                dim0 = self._generate_node(val_node.children[1])
+                dim1 = self._generate_node(val_node.children[2])
+                dim2 = self._generate_node(val_node.children[3])
+                
+                value_expr = f"tl.permute({tensor_expr}, ({dim0}, {dim1}, {dim2}))"
+            
+            elif val_node.node_type == NodeType.UNSQUEEZE:
+                child = val_node.children[0]
+                # Generate child if needed
+                if child.node_type == NodeType.LOAD and not hasattr(child, 'temp_var'):
+                    code += self._generate_node(child) + "\n"
+                
+                # Get tensor expression
+                tensor_expr = child.temp_var if hasattr(child, 'temp_var') else self._generate_node(child)
+                
+                # Get dimension
+                dim = self._generate_node(val_node.children[1])
+                
+                value_expr = f"tl.expand_dims({tensor_expr}, {dim})"
+            
+            elif val_node.node_type == NodeType.SQUEEZE:
+                child = val_node.children[0]
+                # Generate child if needed
+                if child.node_type in [NodeType.LOAD, NodeType.PERMUTE3] and not hasattr(child, 'temp_var'):
+                    code += self._generate_node(child)
+                    if not code.endswith('\n'):
+                        code += '\n'
+                
+                # Get tensor expression
+                tensor_expr = child.temp_var if hasattr(child, 'temp_var') else self._generate_node(child)
+
+                # Get dimension (for squeeze, we use reshape instead)
+                # Infer the source tensor name for dimension info
+                source_tensor_name = self._infer_tensor_name(child)
+                
+                # For squeeze operations, we need to use the source tensor's dimensions
+                # after removing the squeezed dimension
+                if source_tensor_name and source_tensor_name in self.tensor_shapes:
+                    # Get the squeezed dimension
+                    squeeze_dim = int(self._generate_node(val_node.children[1]))
+                    
+                    # Check if child was a permute operation to map dimensions correctly
+                    if child.node_type == NodeType.PERMUTE3 and hasattr(child, 'permute_dims'):
+                        # Get the permuted dimension order
+                        perm_dims = child.permute_dims  # e.g., (1, 0, 2)
+                        shape_parts = []
+                        
+                        # Build shape from source tensor dimensions, excluding squeezed dim
+                        for i in range(len(perm_dims)):
+                            if i != squeeze_dim:  # Skip the dimension to be squeezed
+                                orig_dim = perm_dims[i]
+                                shape_parts.append(f"{source_tensor_name}_dim{orig_dim}")
+                    else:
+                        # No permutation, use original dimension order
+                        shape_parts = []
+                        num_dims = len(self.tensor_shapes[source_tensor_name])
+                        for i in range(num_dims):
+                            if i != squeeze_dim:  # Skip the dimension to be squeezed
+                                shape_parts.append(f"{source_tensor_name}_dim{i}")
+                    
+                    shape_str = f"({', '.join(shape_parts)})"
+                    value_expr = f"tl.reshape({tensor_expr}, {shape_str})"
+                else:
+                    # Fallback: use output tensor dimensions if available
+                    if tensor_name in self.tensor_shapes:
+                        shape_dims = []
+                        for i in range(len(self.tensor_shapes[tensor_name])):
+                            shape_dims.append(f"{tensor_name}_dim{i}")
+                        shape_str = f"({', '.join(shape_dims)})"
+                        value_expr = f"tl.reshape({tensor_expr}, {shape_str})"
+                    else:
+                        # Last resort: tensor already reshaped in squeeze operation
+                        value_expr = f"{tensor_expr}"
+
+        # Handle other expression types
+        elif self._contains_loads(val_node) or self._contains_reduce_sum(val_node):
             code += self._generate_loads_separately(val_node)
             
             # Check if we have nested matmuls and handle them
@@ -581,28 +1017,75 @@ def {kernel_name}(
         else:
             value_expr = self._generate_node(val_node)
         
-        offset_expr, mask_expr = self._generate_index(index_node, tensor_name)
-        
-        # Generate unique variable names for offset and mask
-        offset_var = f"offset_{self.offset_counter}"
-        mask_var = f"mask_{self.mask_counter}"
-        self.offset_counter += 1
-        self.mask_counter += 1
-        
-        # Generate code with separate offset and mask variables
         # Use proper indentation based on current context
         indent_str = '    ' * self.indent_level
-        code += f"{indent_str}{offset_var} = {offset_expr}\n"
-        code += f"{indent_str}{mask_var} = {mask_expr}\n"
-        code += f"{indent_str}tl.store({tensor_name}_ptr + {offset_var}, {value_expr}, mask={mask_var})"
+        
+        # Check if this is an output tensor or cross-kernel intermediate tensor
+        if tensor_type == NodeType.OUTPUT or (tensor_name in self.cross_kernel_tensors):
+            # For output tensors and cross-kernel intermediates, use tl.store
+            offset_expr = self._generate_index(index_node, tensor_name)
+            
+            # Generate unique variable names for offset
+            offset_var = f"offset_{self.offset_counter}"
+            self.offset_counter += 1
+            
+            # Generate code with separate offset variable
+            code += f"{indent_str}{offset_var} = {offset_expr}\n"
+            code += f"{indent_str}tl.store({tensor_name}_ptr + {offset_var}, {value_expr})"
+        else:
+            # For intermediate tensors (pre-allocated with tl.zeros), use direct assignment
+            # Check if index has any tiles or if it's a simple element access
+            has_tiles = any(child.node_type in [NodeType.TILE, NodeType.FULLTILE] 
+                          for child in index_node.children)
+            
+            if has_tiles:
+                # For tiled access, we need to handle accumulation patterns
+                # Check if this is an accumulation pattern (common in matrix multiply)
+                if val_node.node_type == NodeType.ADD and len(val_node.children) > 0:
+                    # Check for (+ (x 1 (load tensor ...)) ...) or (+ (x (load tensor ...) 1) ...)  pattern
+                    first_child = val_node.children[0]
+                    if (first_child.node_type == NodeType.MUL and 
+                        len(first_child.children) == 2):
+                        # Check if it's (x 1 load) or (x load 1)
+                        is_accumulation = False
+                        if (first_child.children[0].node_type == NodeType.NUM and
+                            first_child.children[0].value == '1' and
+                            first_child.children[1].node_type == NodeType.LOAD):
+                            # Pattern: (x 1 load)
+                            is_accumulation = True
+                        elif (first_child.children[1].node_type == NodeType.NUM and
+                              first_child.children[1].value == '1' and
+                              first_child.children[0].node_type == NodeType.LOAD):
+                            # Pattern: (x load 1)
+                            is_accumulation = True
+                        
+                        if is_accumulation:
+                            # This is an accumulation pattern - skip the "* 1" part
+                            if len(val_node.children) > 1:
+                                new_value = self._generate_node_without_loads(val_node.children[1])
+                                code += f"{indent_str}{tensor_name} += {new_value}"
+                            else:
+                                # Only (x 1 load) with no addition - just assign
+                                code += f"{indent_str}{tensor_name} = {value_expr}"
+                        else:
+                            # Regular addition but not accumulation pattern
+                            code += f"{indent_str}{tensor_name} = {value_expr}"
+                    else:
+                        # Regular addition but not accumulation pattern
+                        code += f"{indent_str}{tensor_name} = {value_expr}"
+                else:
+                    # Direct assignment for non-accumulation patterns
+                    code += f"{indent_str}{tensor_name} = {value_expr}"
+            else:
+                # For element access, direct assignment
+                code += f"{indent_str}{tensor_name} = {value_expr}"
         
         return code
     
-    def _generate_index(self, node: ASTNode, tensor_name: str) -> Tuple[str, str]:
+    def _generate_index(self, node: ASTNode, tensor_name: str) -> str:
         """Generate index calculation for memory access"""
         # (index tile1 tile2 ...)
         offsets = []
-        masks = []
         
         for i, child in enumerate(node.children):
             if child.node_type == NodeType.TILE:
@@ -612,48 +1095,47 @@ def {kernel_name}(
                     
                     # Use BLOCK_SIZE parameter instead of hardcoded tile_size
                     block_param = f"BLOCK_{loop_var.upper()}"
-                    # Get end parameter (tensor dimension)
-                    end_param = self._get_end_param(loop_var, end)
                     
-                    if is_parallel:
-                        # For parallel loops, create tile range from program_id * tile_size
-                        offset_expr = f"{loop_var} + tl.arange(0, {block_param})"
-                        mask_expr = f"({loop_var} + tl.arange(0, {block_param})) < {end_param}"
-                    else:
-                        # For sequential loops, use regular indexing
-                        offset_expr = f"{loop_var} + tl.arange(0, {block_param})"
-                        mask_expr = f"({loop_var} + tl.arange(0, {block_param})) < {end_param}"
+                    # For both parallel and sequential loops, create tile range
+                    offset_expr = f"{loop_var} + tl.arange(0, {block_param})"
                     
                     offsets.append(offset_expr)
-                    masks.append(mask_expr)
             elif child.node_type == NodeType.FULLTILE:
                 # For fulltile, we need to determine the appropriate dimension
                 # This represents the full dimension being accessed
                 # We'll use the tensor dimension parameter
                 fulltile_dim = f"{tensor_name}_dim{i}"
                 offsets.append(f"tl.arange(0, {fulltile_dim})")
-                masks.append(f"tl.arange(0, {fulltile_dim}) < {fulltile_dim}")
             elif child.node_type == NodeType.ELEM:
                 # For elem indexing, use the loop variable directly without creating a range
                 # (elem n) means use n as a scalar index
                 if child.children:
                     elem_var = child.children[0].value
-                    # This is a scalar index, not a range
-                    offsets.append(elem_var)
-                    masks.append("True")  # No mask needed for scalar index
+                    # Divide by tile size to get actual dimension index
+                    # elem n with ploop means n can be 0, 64, 128, ... so we need n//BLOCK_N
+                    block_param = f"BLOCK_{elem_var.upper()}"
+                    offsets.append(f"({elem_var} // {block_param})")
+            elif child.node_type == NodeType.CONST_TILE:
+                # For const_tile, create a range from start to start+size
+                # (const_tile start size) means [start:start+size]
+                if len(child.children) >= 2:
+                    start = self._generate_node(child.children[0])
+                    size = self._generate_node(child.children[1])
+                    offsets.append(f"{start} + tl.arange(0, {size})")
         
         # Generate multi-dimensional indexing
         if len(offsets) == 1:
             # For 1D tensors, still need to multiply by stride
             offset_str = f"({offsets[0]}) * {tensor_name}_stride0"
-            mask_str = masks[0]
         else:
             # Multi-dimensional indexing: i[:,None]*tensor_stride0 + j[None,:]*tensor_stride1
             offset_parts = []
-            mask_parts = []
             
             # Check which dimensions are scalar (elem) vs array (tile/fulltile)
-            is_scalar = [mask == "True" for mask in masks]
+            is_scalar = []
+            for off in offsets:
+                # Check if offset contains tl.arange (array) or is just a scalar expression
+                is_scalar.append("tl.arange" not in off)
             
             for dim, off in enumerate(offsets):
                 stride_term = f" * {tensor_name}_stride{dim}"
@@ -661,7 +1143,6 @@ def {kernel_name}(
                 if is_scalar[dim]:
                     # Scalar index - no broadcasting needed
                     offset_parts.append(f"({off}){stride_term}")
-                    mask_parts.append("True")
                 else:
                     # Array index - need broadcasting
                     # Calculate how many None dimensions to add
@@ -675,22 +1156,14 @@ def {kernel_name}(
                     if len([n for n in nones if n == ":"]) == 1 and len([n for n in nones if n == "None"]) == 0:
                         # Only one dimension, no broadcasting needed
                         offset_parts.append(f"({off}){stride_term}")
-                        mask_parts.append(f"{masks[dim]}")
                     else:
                         # Need broadcasting
                         broadcast_expr = "[" + ", ".join(nones) + "]"
                         offset_parts.append(f"({off}){broadcast_expr}{stride_term}")
-                        mask_parts.append(f"({masks[dim]}){broadcast_expr}")
             
             offset_str = " + ".join(offset_parts)
-            # Create combined mask - only multiply non-True masks
-            non_true_masks = [m for m in mask_parts if m != "True"]
-            if non_true_masks:
-                mask_str = " * ".join(non_true_masks)
-            else:
-                mask_str = "True"
         
-        return offset_str, mask_str
+        return offset_str
     
     def _generate_binary_op(self, node: ASTNode, op: str) -> str:
         """Generate binary operation"""
@@ -843,12 +1316,15 @@ def {kernel_name}(
             tensor_expr = self._generate_node(tensor_child)
         
         # In Triton, to broadcast:
-        # - Along dimension 0 (rows): use [None, :]
-        # - Along dimension 1 (columns): use [:, None]
+        # - Along dimension 0: use [None, :] or [None, :, :]
+        # - Along dimension 1: use [:, None] or [:, None, :]
+        # - Along dimension 2: use [:, :, None]
         if broadcast_dim == 0:
             return f"{tensor_expr}[None, :]"
         elif broadcast_dim == 1:
             return f"{tensor_expr}[:, None]"
+        elif broadcast_dim == 2:
+            return f"{tensor_expr}[:, :, None]"
         else:
             # For higher dimensions, we'd need more complex indexing
             raise NotImplementedError(f"Broadcast along dimension {broadcast_dim} not yet implemented")
@@ -1169,12 +1645,18 @@ def {kernel_name}(
         code = ""
         if node.node_type == NodeType.LOAD:
             # Generate load without additional indentation
-            code += self._generate_node(node) + "\n"
+            load_code = self._generate_node(node)
+            if load_code:  # Only add if there's actual code
+                code += load_code
+                if not load_code.endswith('\n'):
+                    code += '\n'
         elif node.node_type in [NodeType.PERMUTE3, NodeType.SQUEEZE, NodeType.UNSQUEEZE]:
             # Generate these operations as well since they produce temp vars
-            code += self._generate_node(node)
-            if not code.endswith('\n'):
-                code += '\n'
+            op_code = self._generate_node(node)
+            if op_code:  # Only add if there's actual code
+                code += op_code
+                if not op_code.endswith('\n'):
+                    code += '\n'
         else:
             for child in node.children:
                 if isinstance(child, ASTNode):
@@ -1265,6 +1747,9 @@ def {kernel_name}(
         # Store temp var in node for parent operations
         node.temp_var = temp_var
         
+        # Store the permutation dimensions for later use (e.g., in squeeze)
+        node.permute_dims = (int(dim0), int(dim1), int(dim2))
+        
         return code
     
     def _generate_squeeze(self, node: ASTNode) -> str:
@@ -1321,10 +1806,24 @@ def {kernel_name}(
                 # Default to 3D for typical attention tensors
                 num_dims = 3
             
-            shape_parts = []
-            for i in range(num_dims):
-                if i != int(dim):  # Skip the dimension to be squeezed
-                    shape_parts.append(f"{source_tensor_name}_dim{i}")
+            # Check if the child was a permute operation
+            if child.node_type == NodeType.PERMUTE3 and hasattr(child, 'permute_dims'):
+                # Get the permuted dimension order
+                perm_dims = child.permute_dims  # e.g., (1, 0, 2)
+                shape_parts = []
+                
+                # Map the original dimensions through the permutation
+                for i in range(num_dims):
+                    if i != int(dim):  # Skip the dimension to be squeezed
+                        # Find which original dimension this corresponds to
+                        orig_dim = perm_dims[i]
+                        shape_parts.append(f"{source_tensor_name}_dim{orig_dim}")
+            else:
+                # No permutation, use original dimension order
+                shape_parts = []
+                for i in range(num_dims):
+                    if i != int(dim):  # Skip the dimension to be squeezed
+                        shape_parts.append(f"{source_tensor_name}_dim{i}")
             
             # Pass shape directly as tuple to tl.reshape
             shape_tuple = f"({', '.join(shape_parts)})"
