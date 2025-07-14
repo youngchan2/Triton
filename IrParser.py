@@ -72,6 +72,7 @@ class IRParser:
             'sloop': NodeType.SLOOP,
             'input': NodeType.INPUT,
             'output': NodeType.OUTPUT,
+            'tensor': NodeType.TENSOR,
             'tile': NodeType.TILE,
             'fulltile': NodeType.FULLTILE,
             'index': NodeType.INDEX,

@@ -28,3 +28,4 @@ class NodeType(Enum):
     SQUEEZE = "squeeze"  # Remove dimension
     UNSQUEEZE = "unsqueeze"  # Add dimension
     CONST_TILE = "const_tile"  # Constant range tile [start:start+size]
+    TENSOR = "tensor"  # Intermediate tensor
