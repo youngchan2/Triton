@@ -15,6 +15,6 @@
     - [x] Handle with cross-kernel tensors with `tl.store`   
             (Add condition for using `tl.store`)
     - [x] Determine which intermediate tensors should be initialized with `tl.zeros`  
-    - [ ] Need to optimize the number of argument of kernel   
-    - [ ] Determine how to apply the tensor information with external file   
+    - [x] Need to optimize the number of argument of kernel   
+    - [x] Determine how to apply the tensor information with external file   
     - [ ] Evaluation for the various computation
