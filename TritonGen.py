@@ -1166,14 +1166,8 @@ def {kernel_name}(
         code = f"{indent_str}{offset_var} = {offset_expr}\n"
         code += f"{indent_str}{var_name} = tl.load({tensor_name}_ptr + {offset_var})"
         
-        # Check if we need to expand_dims when first index is elem
-        # This happens when loading from 3D tensor with elem indexing on first dimension
-        index_types = [child.node_type for child in index_node.children]
-        if (len(index_types) == 3 and index_types[0] == NodeType.ELEM and
-            tensor_name in self.tensor_shapes and len(self.tensor_shapes[tensor_name]) == 3):
-            # The load returns 2D but we need 3D for operations like permute3
-            # Add expand_dims(0) to restore the batch dimension
-            code += f".expand_dims(0)"
+        # No need for expand_dims anymore - proper offset calculation handles all dimensions
+        # The loaded tensor will have the correct shape based on the offset dimensions
         
         return code
     
@@ -1456,10 +1450,17 @@ def {kernel_name}(
                 # (elem n) means use n as a scalar index
                 if child.children:
                     elem_var = child.children[0].value
-                    # Divide by tile size to get actual dimension index
-                    # elem n with ploop means n can be 0, 64, 128, ... so we need n//BLOCK_N
-                    block_param = f"BLOCK_{elem_var.upper()}"
-                    offsets.append(f"({elem_var} // {block_param})")
+                    # Check if this is the first dimension of a 3D tensor (batch/head dimension)
+                    # In DNN context, 3D tensors often have batch as first dimension
+                    if i == 0 and tensor_name in self.tensor_shapes and len(self.tensor_shapes[tensor_name]) == 3:
+                        # For batch dimension in 3D tensors, we process one element at a time
+                        # within the kernel, so use tl.arange(0, 1)
+                        offsets.append("tl.arange(0, 1)")
+                    else:
+                        # Divide by tile size to get actual dimension index
+                        # elem n with ploop means n can be 0, 64, 128, ... so we need n//BLOCK_N
+                        block_param = f"BLOCK_{elem_var.upper()}"
+                        offsets.append(f"({elem_var} // {block_param})")
             elif child.node_type == NodeType.CONST_TILE:
                 # For const_tile, create a range from start to start+size
                 # (const_tile start size) means [start:start+size]

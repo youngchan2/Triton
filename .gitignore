@@ -11,3 +11,4 @@ benchmark_results.json
 tritongen_v1.py
 tritongen_v2.py
 *.run
+benchmark*
