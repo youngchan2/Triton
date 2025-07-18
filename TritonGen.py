@@ -23,6 +23,8 @@ class TritonCodeGen:
         self.stored_tensor_dims = {}  # Track which tensors are stored in parallel loops: loop_var -> [(tensor, dim)]
         self.load_cache = {}  # Cache for load operations: (tensor_name, offset_expr) -> temp_var
         self.constants = {}  # Map variable names (e.g., 'N', 'M') to their constant values
+        self.sloop_temp_vars = {}  # Map tensor_name -> temp_var_name for sloop non-accumulation stores
+        self.current_sloop_info = None  # Track current sloop context: (loop_var, sloop_node)
         
     def resolve_value(self, value) -> str:
         """Resolve a value that might be a variable name or expression to its constant value.
@@ -97,6 +99,9 @@ class TritonCodeGen:
             tensor_shapes: Optional tensor shape information
             constants: Optional mapping of variable names to constant values
         """
+        # Store current AST for use in sloop generation
+        self.current_ast = ast
+        
         if tensor_shapes:
             self.tensor_shapes = tensor_shapes
         if constants:
@@ -402,6 +407,8 @@ import torch
         self.stored_tensor_dims = {}
         self.load_cache = {}  # Reset load cache for each kernel
         self.intermediate_tensor_indices = {}  # Reset intermediate tensor indices
+        self.sloop_temp_vars = {}  # Clear sloop temp vars for new kernel
+        self.current_sloop_info = None  # Reset sloop context
         
         # First pass: collect all tensors used in the AST
         self._collect_tensors(ast)
@@ -705,6 +712,132 @@ import torch
                 cross_sloop_tensors.add(tensor_name)
         
         return cross_sloop_tensors
+
+    def _identify_sloop_intermediate_tensors(self, ast: ASTNode) -> set:
+        """Identify intermediate tensors that are defined inside sloop"""
+        sloop_intermediate_tensors = set()
+        
+        def traverse(node: ASTNode, in_sloop: bool = False):
+            if node.node_type == NodeType.SLOOP:
+                # Mark that we're inside an sloop for child nodes
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        traverse(child, in_sloop=True)
+            elif node.node_type == NodeType.STORE and in_sloop:
+                # Check if this is storing to an intermediate tensor
+                tensor_node = node.children[0]
+                if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
+                    tensor_name = tensor_node.children[0].value
+                    if tensor_name in self.intermediate_tensors:
+                        sloop_intermediate_tensors.add(tensor_name)
+                # Continue traversing children
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        traverse(child, in_sloop)
+            else:
+                # Continue traversing children
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        traverse(child, in_sloop)
+        
+        traverse(ast)
+        return sloop_intermediate_tensors
+    
+    def _identify_sloop_intermediate_tensors_without_loop_var(self, ast: ASTNode) -> dict:
+        """Identify intermediate tensors that are defined inside sloop and don't use loop variable"""
+        sloop_tensors_no_loop_var = {}  # {tensor_name: [(sloop_node, loop_var), ...]}
+        
+        def check_expression_uses_loop_var(expr: ASTNode, loop_var: str) -> bool:
+            """Check if an expression uses the loop variable"""
+            if expr.node_type == NodeType.VAR and expr.value == loop_var:
+                return True
+            
+            # Check children recursively
+            for child in expr.children:
+                if isinstance(child, ASTNode):
+                    if check_expression_uses_loop_var(child, loop_var):
+                        return True
+            return False
+        
+        def traverse(node: ASTNode, in_sloop: bool = False, current_sloop_node: ASTNode = None, current_loop_var: str = None):
+            if node.node_type == NodeType.SLOOP:
+                # Extract loop variable from sloop node
+                # (sloop start end tile_size loop_var body)
+                loop_var = node.children[3].value
+                # Mark that we're inside an sloop for child nodes
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        traverse(child, in_sloop=True, current_sloop_node=node, current_loop_var=loop_var)
+            elif node.node_type == NodeType.STORE and in_sloop:
+                # Check if this is storing to an intermediate tensor
+                tensor_node = node.children[0]
+                if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
+                    tensor_name = tensor_node.children[0].value
+                    if tensor_name in self.intermediate_tensors:
+                        # Check if the store expression uses the loop variable
+                        uses_loop_var = False
+                        if len(node.children) > 1:
+                            # Check the expression being stored
+                            uses_loop_var = check_expression_uses_loop_var(node.children[1], current_loop_var)
+                            
+                        # Also check index expressions
+                        if not uses_loop_var and len(node.children) > 2:
+                            for i in range(2, len(node.children)):
+                                if isinstance(node.children[i], ASTNode):
+                                    if check_expression_uses_loop_var(node.children[i], current_loop_var):
+                                        uses_loop_var = True
+                                        break
+                        
+                        if not uses_loop_var:
+                            if tensor_name not in sloop_tensors_no_loop_var:
+                                sloop_tensors_no_loop_var[tensor_name] = []
+                            sloop_tensors_no_loop_var[tensor_name].append((current_sloop_node, current_loop_var))
+                
+                # Continue traversing children
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        traverse(child, in_sloop, current_sloop_node, current_loop_var)
+            else:
+                # Continue traversing children
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        traverse(child, in_sloop, current_sloop_node, current_loop_var)
+        
+        traverse(ast)
+        return sloop_tensors_no_loop_var
+    
+    def _expression_uses_var(self, expr: ASTNode, var_name: str) -> bool:
+        """Check if an expression uses a specific variable"""
+        if expr.node_type == NodeType.VAR and expr.value == var_name:
+            return True
+        for child in expr.children:
+            if isinstance(child, ASTNode) and self._expression_uses_var(child, var_name):
+                return True
+        return False
+    
+    def _is_accumulation_in_sloop(self, sloop_node: ASTNode, tensor_name: str) -> bool:
+        """Check if a tensor is used in accumulation pattern within a specific sloop"""
+        def check_stores_in_node(node: ASTNode) -> bool:
+            if node.node_type == NodeType.STORE:
+                tensor_node = node.children[0]
+                if (tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR] and
+                    tensor_node.children[0].value == tensor_name):
+                    # Check if this is an accumulation pattern
+                    if len(node.children) > 1:
+                        return self._is_accumulation_pattern(node.children[1], tensor_name)
+            
+            # Check children
+            for child in node.children:
+                if isinstance(child, ASTNode):
+                    if check_stores_in_node(child):
+                        return True
+            return False
+        
+        # Check the body of the sloop
+        if len(sloop_node.children) > 4:
+            body = sloop_node.children[4]
+            return check_stores_in_node(body)
+        return False
     
     def _expression_contains_tensor(self, expr: ASTNode, tensor_name: str) -> bool:
         """Check if an expression contains a load of the given tensor"""
@@ -742,16 +875,47 @@ import torch
         # Only allocate intermediate tensors that are NOT cross-kernel tensors
         local_intermediates = self.intermediate_tensors - self.cross_kernel_tensors
         
-        if not local_intermediates:
+        # Track temporary variables that will be created for sloop non-accumulation stores
+        sloop_temp_vars_shapes = {}
+        
+        if not local_intermediates and not sloop_temp_vars_shapes:
             return ""
         
         # Identify which tensors are accumulators
         accumulators = set()
         # Identify which tensors are used across different sloops
         cross_sloop_tensors = set()
+        # Identify intermediate tensors that are defined inside sloop
+        sloop_intermediate_tensors = set()
         if ast:
             accumulators = self._identify_accumulators(ast)
             cross_sloop_tensors = self._identify_cross_sloop_tensors(ast)
+            sloop_intermediate_tensors = self._identify_sloop_intermediate_tensors(ast)
+            
+            # Identify tensors that will need temp vars in sloop
+            sloop_tensors_no_loop_var = self._identify_sloop_intermediate_tensors_without_loop_var(ast)
+            temp_counter_saved = self.temp_counter
+            
+            # Check each sloop individually for accumulation patterns
+            for tensor_name in sloop_tensors_no_loop_var:
+                
+                if tensor_name in self.intermediate_tensors:
+                    # For each sloop where this tensor appears without loop var
+                    for sloop_node, loop_var in sloop_tensors_no_loop_var[tensor_name]:
+                        # Check if in THIS specific sloop, the tensor is used in a non-accumulation pattern
+                        is_accumulation_in_this_sloop = self._is_accumulation_in_sloop(sloop_node, tensor_name)
+                        
+                        if not is_accumulation_in_this_sloop:
+                            # Generate the same temp var name that will be used later
+                            # Use a deterministic naming scheme based on tensor name
+                            temp_var_name = f"{tensor_name}_tmp"
+                            sloop_temp_vars_shapes[temp_var_name] = self.tensor_shapes.get(tensor_name, [])
+                            # Also store mapping for later use
+                            if not hasattr(self, 'sloop_tensor_temp_mapping'):
+                                self.sloop_tensor_temp_mapping = {}
+                            self.sloop_tensor_temp_mapping[tensor_name] = temp_var_name
+                            # Only create one temp var per tensor, even if used in multiple sloops
+                            break
         
         code = "    # Allocate intermediate tensors\n"
         
@@ -826,9 +990,9 @@ import torch
                 
                 shape_str = f"({', '.join(shape_params)})"
                 
-                # Initialize with zeros if it's an accumulator OR if it's used across different sloops
-                if tensor_name in accumulators or tensor_name in cross_sloop_tensors:
-                    code += f"    {tensor_name} = tl.zeros({shape_str}, dtype=tl.float32)\n"
+                # Initialize with zeros if it's an accumulator OR if it's used across different sloops OR if it's defined inside sloop
+                if tensor_name in accumulators or tensor_name in cross_sloop_tensors or tensor_name in sloop_intermediate_tensors:
+                    code += f"    {tensor_name} = tl.zeros({shape_str}, dtype=tl.float16)\n"
                 # else:
                 #     # For non-accumulator tensors, just comment that they'll be assigned
                 #     code += f"    # {tensor_name} will be assigned without initialization\n"
@@ -838,6 +1002,19 @@ import torch
             #         code += f"    {tensor_name} = tl.zeros(({tensor_name}_dim0, {tensor_name}_dim1), dtype=tl.float32)\n"
             #     else:
             #         code += f"    # {tensor_name} will be assigned without initialization\n"
+        
+        # Also allocate temporary variables for sloop non-accumulation stores
+        for temp_var_name in sorted(sloop_temp_vars_shapes):
+            shape = sloop_temp_vars_shapes[temp_var_name]
+            # Build shape string using constants or literal values
+            shape_params = []
+            for dim in shape:
+                if isinstance(dim, str):
+                    shape_params.append(dim)
+                else:
+                    shape_params.append(str(dim))
+            shape_str = f"({', '.join(shape_params)})"
+            code += f"    {temp_var_name} = tl.zeros({shape_str}, dtype=tl.float16)\n"
         
         code += "\n"
         return code
@@ -1088,7 +1265,12 @@ def {kernel_name}(
         saved_load_cache = self.load_cache.copy()
         self.load_cache = {}
         
+        # Set current sloop context
+        saved_sloop_info = self.current_sloop_info
+        self.current_sloop_info = (loop_var, node)
+        
         self.indent_level += 1
+        
         body_code = self._generate_node(body)
         # Remove any leading/trailing newlines from body to avoid double newlines
         body_code = body_code.strip('\n')
@@ -1101,6 +1283,9 @@ def {kernel_name}(
         
         # Restore load cache after loop
         self.load_cache = saved_load_cache
+        
+        # Restore previous sloop context
+        self.current_sloop_info = saved_sloop_info
         
         return code
     
@@ -1126,6 +1311,11 @@ def {kernel_name}(
         index_node = node.children[1]
         
         tensor_name = tensor_node.children[0].value
+        
+        # Check if we have a temporary variable for this tensor (from sloop non-accumulation store)
+        if tensor_name in self.sloop_temp_vars:
+            node.temp_var = self.sloop_temp_vars[tensor_name]
+            return ""
         
         # Check if this is a local intermediate tensor (not cross-kernel)
         if tensor_name in self.intermediate_tensors and tensor_name not in self.cross_kernel_tensors:
@@ -1359,7 +1549,27 @@ def {kernel_name}(
             has_tiles = any(child.node_type in [NodeType.TILE, NodeType.FULLTILE] 
                           for child in index_node.children)
             
-            if has_tiles:
+            # Check if we're in a sloop and need to create a temporary variable
+            should_create_temp = False
+            if (self.current_sloop_info and 
+                tensor_name in self.intermediate_tensors and
+                not self._is_accumulation_pattern(val_node, tensor_name)):
+                # Check if the expression uses the loop variable
+                loop_var, sloop_node = self.current_sloop_info
+                if not self._expression_uses_var(val_node, loop_var):
+                    should_create_temp = True
+            
+            if should_create_temp:
+                # Create a temporary variable for this non-accumulation store in sloop
+                # Use the pre-determined temp var name
+                if hasattr(self, 'sloop_tensor_temp_mapping') and tensor_name in self.sloop_tensor_temp_mapping:
+                    temp_var = self.sloop_tensor_temp_mapping[tensor_name]
+                else:
+                    # Fallback to deterministic naming
+                    temp_var = f"{tensor_name}_tmp"
+                self.sloop_temp_vars[tensor_name] = temp_var
+                code += f"{indent_str}{temp_var} = {value_expr}"
+            elif has_tiles:
                 # For tiled access, we need to handle accumulation patterns
                 # Check if this is an accumulation pattern (common in matrix multiply)
                 if val_node.node_type == NodeType.ADD and len(val_node.children) > 0:
@@ -1455,7 +1665,8 @@ def {kernel_name}(
                     if i == 0 and tensor_name in self.tensor_shapes and len(self.tensor_shapes[tensor_name]) == 3:
                         # For batch dimension in 3D tensors, we process one element at a time
                         # within the kernel, so use tl.arange(0, 1)
-                        offsets.append("tl.arange(0, 1)")
+                        block_param = f"BLOCK_{elem_var.upper()}"
+                        offsets.append(f"({elem_var}//{block_param})+tl.arange(0, 1)")
                     else:
                         # Divide by tile size to get actual dimension index
                         # elem n with ploop means n can be 0, 64, 128, ... so we need n//BLOCK_N
@@ -1528,7 +1739,7 @@ def {kernel_name}(
         else:
             right = self._generate_node(right_child)
             
-        return f"({left} {op} {right})"
+        return f"({left} {op} {right}).to(tl.float16)"
     
     def _generate_unary_op(self, node: ASTNode, op: str) -> str:
         """Generate unary operation"""
@@ -1539,8 +1750,12 @@ def {kernel_name}(
             operand = child.temp_var
         else:
             operand = self._generate_node(child)
-            
-        return f"{op}({operand})"
+        
+        # For exp operation, convert input to float32
+        if op == "tl.exp":
+            return f"{op}({operand}.to(tl.float32)).to(tl.float16)"
+        else:
+            return f"{op}({operand}).to(tl.float16)"
     
     def _generate_matmul(self, node: ASTNode) -> str:
         """Generate matrix multiplication"""
@@ -1604,8 +1819,8 @@ def {kernel_name}(
                 # Result = X @ T1 + X @ T2
                 if len(left_tensors) == 2 and len(right_tensors) == 2:
                     # Assuming left_tensors[0] == left_tensors[1] (both are X)
-                    matmul1 = f"tl.dot({left_tensors[0]}, {right_tensors[0]})"
-                    matmul2 = f"tl.dot({left_tensors[1]}, {right_tensors[1]})"
+                    matmul1 = f"tl.dot({left_tensors[0]}, {right_tensors[0]}).to(tl.float16)"
+                    matmul2 = f"tl.dot({left_tensors[1]}, {right_tensors[1]}).to(tl.float16)"
                     return f"({matmul1} + {matmul2})"
                 else:
                     # Fallback for other concat patterns
@@ -1625,7 +1840,7 @@ def {kernel_name}(
             right = self._generate_node(right_child)
             
         # For DNN compiler, use tl.dot with allow_tf32=False for exact computation
-        return f"tl.dot({left}, {right})"
+        return f"tl.dot({left}, {right}).to(tl.float16)"
     
     def _generate_reduce_sum(self, node: ASTNode) -> str:
         """Generate reduce sum operation"""
@@ -1635,11 +1850,11 @@ def {kernel_name}(
         
         if child.node_type == NodeType.LOAD and hasattr(child, 'temp_var'):
             # Use the temp variable if it was already generated
-            return f"tl.sum({child.temp_var}, axis={axis})"
+            return f"tl.sum({child.temp_var}, axis={axis}, dtype=tl.float16)"
         else:
             # Generate the child expression
             tensor = self._generate_node(child)
-            return f"tl.sum({tensor}, axis={axis})"
+            return f"tl.sum({tensor}, axis={axis}, dtype=tl.float16)"
     
     def _generate_broadcast(self, node: ASTNode) -> str:
         """Generate broadcast operation
@@ -1919,7 +2134,7 @@ def {kernel_name}(
                 else:
                     right_expr = f"temp_{self._find_temp_var_index(right)}"
                 
-                code += f"{indent_str}{temp_name} = tl.dot({left_expr}, {right_expr})\n"
+                code += f"{indent_str}{temp_name} = tl.dot({left_expr}, {right_expr}).to(tl.float16)\n"
                 
                 # Mark the node with the temp variable name
                 inner_matmul.temp_var = temp_name
@@ -2004,7 +2219,7 @@ def {kernel_name}(
                         right_expr = right_child.temp_var if hasattr(right_child, 'temp_var') else self._generate_node_without_loads(right_child)
                         
                         # Generate the computation
-                        code_line = f"{indent_str}{temp_name} = tl.dot({left_expr}, {right_expr})\n"
+                        code_line = f"{indent_str}{temp_name} = tl.dot({left_expr}, {right_expr}).to(tl.float16)\n"
                         
                         # Store temp_var for later use
                         inner_matmul.temp_var = temp_name
@@ -2085,16 +2300,16 @@ def {kernel_name}(
                 right = node.children[1]
                 left_expr = self._generate_node_without_loads(left)
                 right_expr = self._generate_node_without_loads(right)
-                return f"tl.dot({left_expr}, {right_expr})"
+                return f"tl.dot({left_expr}, {right_expr}).to(tl.float16)"
         elif node.node_type == NodeType.RSUM:
             # Handle reduce sum specially
             child = node.children[0]
             axis = self._generate_node(node.children[1])
             if child.node_type == NodeType.LOAD and hasattr(child, 'temp_var'):
-                return f"tl.sum({child.temp_var}, axis={axis})"
+                return f"tl.sum({child.temp_var}, axis={axis}, dtype=tl.float16)"
             else:
                 child_expr = self._generate_node_without_loads(child)
-                return f"tl.sum({child_expr}, axis={axis})"
+                return f"tl.sum({child_expr}, axis={axis}, dtype=tl.float16)"
         elif node.node_type == NodeType.BCAST:
             # Handle broadcast specially
             return self._generate_broadcast(node)

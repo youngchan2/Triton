@@ -17,4 +17,5 @@
     - [x] Determine which intermediate tensors should be initialized with `tl.zeros`  
     - [x] Need to optimize the number of argument of kernel   
     - [x] Determine how to apply the tensor information with external file   
-    - [ ] Evaluation for the various computation
+    - [x] Evaluation for the various computation  
+    - [ ] Determine how to apply mixed precision
