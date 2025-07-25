@@ -2491,12 +2491,12 @@ def {kernel_name}(
         # Get the tensor expression
         if hasattr(child, 'temp_var'):
             tensor_expr = child.temp_var
-        else:
-            # For simple expressions like identifiers, evaluate inline
-            if child.node_type == NodeType.IDENTIFIER:
-                tensor_expr = child.value
-            else:
-                raise ValueError(f"Expected temp_var for {child.node_type} node in squeeze")
+        # else:
+        #     # For simple expressions like identifiers, evaluate inline
+        #     if child.node_type == NodeType.IDENTIFIER:
+        #         tensor_expr = child.value
+        #     else:
+        #         raise ValueError(f"Expected temp_var for {child.node_type} node in squeeze")
         
         # Get the dimension to squeeze
         dim = self._generate_node(node.children[1])
@@ -2602,12 +2602,12 @@ def {kernel_name}(
         # Get the tensor expression
         if hasattr(child, 'temp_var'):
             tensor_expr = child.temp_var
-        else:
-            # For simple expressions like identifiers, evaluate inline
-            if child.node_type == NodeType.IDENTIFIER:
-                tensor_expr = child.value
-            else:
-                raise ValueError(f"Expected temp_var for {child.node_type} node in unsqueeze")
+        # else:
+        #     # For simple expressions like identifiers, evaluate inline
+        #     if child.node_type == NodeType.IDENTIFIER:
+        #         tensor_expr = child.value
+        #     else:
+        #         raise ValueError(f"Expected temp_var for {child.node_type} node in unsqueeze")
         
         # Get the dimension to unsqueeze
         dim = self._generate_node(node.children[1])
