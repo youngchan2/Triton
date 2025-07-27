@@ -444,8 +444,11 @@ import torch
     def _collect_tensors(self, node: ASTNode):
         """Collect all tensor names used in the AST"""
         if node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-            tensor_name = node.children[0].value
-            self.tensors_used.add(tensor_name)
+            # Handle multiple tensor names (comma-separated)
+            for child in node.children:
+                if child.node_type == NodeType.VAR:
+                    tensor_name = child.value
+                    self.tensors_used.add(tensor_name)
 
         for child in node.children:
             if isinstance(child, ASTNode):
@@ -456,27 +459,30 @@ import torch
         if node.node_type == NodeType.STORE:
             tensor_node = node.children[0]
             if tensor_node.node_type == NodeType.TENSOR:
-                tensor_name = tensor_node.children[0].value
-                
-                # Tensor operators represent intermediate tensors
-                # These need to be initialized with tl.zeros
-                self.intermediate_tensors.add(tensor_name)
-                
-                # Infer shape from the store's index using existing tensor shapes
-                if tensor_name not in self.tensor_shapes and len(node.children) >= 3:
-                    index_node = node.children[2]
-                    shape = self._infer_tensor_shape_from_index(index_node)
-                    if shape:
-                        self.tensor_shapes[tensor_name] = shape
-                
-                # Analyze the index pattern to determine actual shape needed
-                if len(node.children) >= 3:
-                    index_node = node.children[2]
-                    if index_node.node_type == NodeType.INDEX:
-                        # Store the index pattern for this tensor
-                        if not hasattr(self, 'intermediate_tensor_indices'):
-                            self.intermediate_tensor_indices = {}
-                        self.intermediate_tensor_indices[tensor_name] = index_node
+                # Handle multiple tensor names (comma-separated)
+                for child in tensor_node.children:
+                    if child.node_type == NodeType.VAR:
+                        tensor_name = child.value
+
+                        # Tensor operators represent intermediate tensors
+                        # These need to be initialized with tl.zeros
+                        self.intermediate_tensors.add(tensor_name)
+                        
+                        # Infer shape from the store's index using existing tensor shapes
+                        if tensor_name not in self.tensor_shapes and len(node.children) >= 3:
+                            index_node = node.children[2]
+                            shape = self._infer_tensor_shape_from_index(index_node)
+                            if shape:
+                                self.tensor_shapes[tensor_name] = shape
+                        
+                        # Analyze the index pattern to determine actual shape needed
+                        if len(node.children) >= 3:
+                            index_node = node.children[2]
+                            if index_node.node_type == NodeType.INDEX:
+                                # Store the index pattern for this tensor
+                                if not hasattr(self, 'intermediate_tensor_indices'):
+                                    self.intermediate_tensor_indices = {}
+                                self.intermediate_tensor_indices[tensor_name] = index_node
         
         # Handle ploop nodes
         if node.node_type == NodeType.PLOOP:
@@ -631,15 +637,29 @@ import torch
                 # Get the tensor being stored to
                 tensor_node = node.children[0]
                 if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                    tensor_name = tensor_node.children[0].value
-                    # Check if the expression being stored involves reading the same tensor
-                    if self._expression_contains_tensor(node.children[1], tensor_name):
-                        # Check if it's an addition pattern
-                        if self._is_accumulation_pattern(node.children[1], tensor_name):
-                                accumulators.add(tensor_name)
-                        # Only mark as accumulator if inside sloop AND it reads itself
-                        elif in_sloop and self._expression_contains_tensor(node.children[1], tensor_name):
-                            accumulators.add(tensor_name)
+                    # Handle multiple tensor names (comma-separated)
+                    for i, child in enumerate(tensor_node.children):
+                        if child.node_type == NodeType.VAR:
+                            tensor_name = child.value
+                            
+                            # For comma-separated tensors, need to check the corresponding load
+                            # in the value expression
+                            val_expr = node.children[1]
+                            if len(tensor_node.children) > 1:
+                                # Multiple tensors - check if this specific tensor is used
+                                modified_expr = self._replace_multi_tensor_loads(val_expr, i)
+                                if self._expression_contains_tensor(modified_expr, tensor_name):
+                                    if self._is_accumulation_pattern(modified_expr, tensor_name):
+                                        accumulators.add(tensor_name)
+                                    elif in_sloop and self._expression_contains_tensor(modified_expr, tensor_name):
+                                        accumulators.add(tensor_name)
+                            else:
+                                # Single tensor - original logic
+                                if self._expression_contains_tensor(val_expr, tensor_name):
+                                    if self._is_accumulation_pattern(val_expr, tensor_name):
+                                        accumulators.add(tensor_name)
+                                    elif in_sloop and self._expression_contains_tensor(val_expr, tensor_name):
+                                        accumulators.add(tensor_name)
         
         def traverse(node: ASTNode, in_sloop: bool = False):
             """Traverse AST to find all store operations"""
@@ -677,11 +697,14 @@ import torch
                 # Track tensor being stored
                 tensor_node = node.children[0] if node.children else None
                 if tensor_node and tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                    tensor_name = tensor_node.children[0].value
-                    if tensor_name not in tensor_sloop_map:
-                        tensor_sloop_map[tensor_name] = set()
-                    if current_sloop_id != -1:  # Only track if inside an sloop
-                        tensor_sloop_map[tensor_name].add(current_sloop_id)
+                    # Handle multiple tensor names (comma-separated)
+                    for child in tensor_node.children:
+                        if child.node_type == NodeType.VAR:
+                            tensor_name = child.value
+                            if tensor_name not in tensor_sloop_map:
+                                tensor_sloop_map[tensor_name] = set()
+                            if current_sloop_id != -1:  # Only track if inside an sloop
+                                tensor_sloop_map[tensor_name].add(current_sloop_id)
                 # Also check expression being stored for tensor loads
                 if len(node.children) > 1:
                     collect_tensor_usage(node.children[1], current_sloop_id)
@@ -693,11 +716,14 @@ import torch
                 # Track tensor being loaded
                 tensor_node = node.children[0] if node.children else None
                 if tensor_node and tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                    tensor_name = tensor_node.children[0].value
-                    if tensor_name not in tensor_sloop_map:
-                        tensor_sloop_map[tensor_name] = set()
-                    if current_sloop_id != -1:  # Only track if inside an sloop
-                        tensor_sloop_map[tensor_name].add(current_sloop_id)
+                    # Handle multiple tensor names (comma-separated)
+                    for child in tensor_node.children:
+                        if child.node_type == NodeType.VAR:
+                            tensor_name = child.value
+                            if tensor_name not in tensor_sloop_map:
+                                tensor_sloop_map[tensor_name] = set()
+                            if current_sloop_id != -1:  # Only track if inside an sloop
+                                tensor_sloop_map[tensor_name].add(current_sloop_id)
             else:
                 # Recursively process children
                 for child in node.children:
@@ -727,9 +753,12 @@ import torch
                 # Check if this is storing to an intermediate tensor
                 tensor_node = node.children[0]
                 if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                    tensor_name = tensor_node.children[0].value
-                    if tensor_name in self.intermediate_tensors:
-                        sloop_intermediate_tensors.add(tensor_name)
+                    # Handle multiple tensor names (comma-separated)
+                    for child in tensor_node.children:
+                        if child.node_type == NodeType.VAR:
+                            tensor_name = child.value
+                            if tensor_name in self.intermediate_tensors:
+                                sloop_intermediate_tensors.add(tensor_name)
                 # Continue traversing children
                 for child in node.children:
                     if isinstance(child, ASTNode):
@@ -772,26 +801,29 @@ import torch
                 # Check if this is storing to an intermediate tensor
                 tensor_node = node.children[0]
                 if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                    tensor_name = tensor_node.children[0].value
-                    if tensor_name in self.intermediate_tensors:
-                        # Check if the store expression uses the loop variable
-                        uses_loop_var = False
-                        if len(node.children) > 1:
-                            # Check the expression being stored
-                            uses_loop_var = check_expression_uses_loop_var(node.children[1], current_loop_var)
-                            
-                        # Also check index expressions
-                        if not uses_loop_var and len(node.children) > 2:
-                            for i in range(2, len(node.children)):
-                                if isinstance(node.children[i], ASTNode):
-                                    if check_expression_uses_loop_var(node.children[i], current_loop_var):
-                                        uses_loop_var = True
-                                        break
-                        
-                        if not uses_loop_var:
-                            if tensor_name not in sloop_tensors_no_loop_var:
-                                sloop_tensors_no_loop_var[tensor_name] = []
-                            sloop_tensors_no_loop_var[tensor_name].append((current_sloop_node, current_loop_var))
+                    # Handle multiple tensor names (comma-separated)
+                    for child in tensor_node.children:
+                        if child.node_type == NodeType.VAR:
+                            tensor_name = child.value
+                            if tensor_name in self.intermediate_tensors:
+                                # Check if the store expression uses the loop variable
+                                uses_loop_var = False
+                                if len(node.children) > 1:
+                                    # Check the expression being stored
+                                    uses_loop_var = check_expression_uses_loop_var(node.children[1], current_loop_var)
+                                
+                                # Also check index expressions
+                                if not uses_loop_var and len(node.children) > 2:
+                                    for i in range(2, len(node.children)):
+                                        if isinstance(node.children[i], ASTNode):
+                                            if check_expression_uses_loop_var(node.children[i], current_loop_var):
+                                                uses_loop_var = True
+                                                break
+                                
+                                if not uses_loop_var:
+                                    if tensor_name not in sloop_tensors_no_loop_var:
+                                        sloop_tensors_no_loop_var[tensor_name] = []
+                                    sloop_tensors_no_loop_var[tensor_name].append((current_sloop_node, current_loop_var))
                 
                 # Continue traversing children
                 for child in node.children:
@@ -844,7 +876,11 @@ import torch
         if expr.node_type == NodeType.LOAD:
             tensor_node = expr.children[0]
             if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                return tensor_node.children[0].value == tensor_name
+                # Handle multiple tensor names (comma-separated)
+                for child in tensor_node.children:
+                    if child.node_type == NodeType.VAR and child.value == tensor_name:
+                        return True
+                return False
         
         # Recursively check children
         for child in expr.children:
@@ -1028,7 +1064,11 @@ import torch
                             # It's a literal number
                             shape_params.append(str(dim))
                 
-                shape_str = f"({', '.join(shape_params)})"
+                # Ensure single-element tuples have trailing comma
+                if len(shape_params) == 1:
+                    shape_str = f"({shape_params[0]},)"
+                else:
+                    shape_str = f"({', '.join(shape_params)})"
                 
                 # Initialize with zeros if it's an accumulator OR if it's used across different sloops OR if it's defined inside sloop
                 if tensor_name in accumulators or tensor_name in cross_sloop_tensors or tensor_name in sloop_intermediate_tensors:
@@ -1053,7 +1093,11 @@ import torch
                     shape_params.append(dim)
                 else:
                     shape_params.append(str(dim))
-            shape_str = f"({', '.join(shape_params)})"
+            # Ensure single-element tuples have trailing comma
+            if len(shape_params) == 1:
+                shape_str = f"({shape_params[0]},)"
+            else:
+                shape_str = f"({', '.join(shape_params)})"
             code += f"    {temp_var_name} = tl.zeros({shape_str}, dtype=tl.float16)\n"
         
         code += "\n"
@@ -1407,12 +1451,53 @@ def {kernel_name}(
         
         return code
     
+    def _replace_multi_tensor_loads(self, node: ASTNode, index: int) -> ASTNode:
+        """Replace multi-tensor loads with single tensor at given index"""
+        import copy
+        
+        # Deep copy the node to avoid modifying the original
+        new_node = copy.deepcopy(node)
+        
+        def replace_loads(n):
+            if n.node_type == NodeType.LOAD:
+                tensor_node = n.children[0]
+                # Check if this load has multiple tensor names
+                if len(tensor_node.children) > 1 and index < len(tensor_node.children):
+                    # Replace with single tensor at index
+                    single_child = tensor_node.children[index]
+                    n.children[0] = ASTNode(tensor_node.node_type, [single_child])
+            
+            # Recursively process children
+            for child in n.children:
+                if isinstance(child, ASTNode):
+                    replace_loads(child)
+        
+        replace_loads(new_node)
+        return new_node
+    
     def _generate_store(self, node: ASTNode) -> str:
         """Generate store operation"""
         # (store tensor val index)
         tensor_node = node.children[0]
         val_node = node.children[1]
         index_node = node.children[2]
+        
+        # Check if tensor_node has multiple children (comma-separated tensors)
+        if len(tensor_node.children) > 1:
+            # Multiple tensors - generate a store for each one
+            code = ""
+            for i, tensor_child in enumerate(tensor_node.children):
+                # Create a new store node for each tensor
+                single_tensor_node = ASTNode(tensor_node.node_type, [tensor_child])
+                
+                # Create a modified value node that uses the corresponding input/tensor
+                modified_val_node = self._replace_multi_tensor_loads(val_node, i)
+                
+                single_store_node = ASTNode(node.node_type, [single_tensor_node, modified_val_node, index_node])
+                code += self._generate_store(single_store_node)
+                if code and not code.endswith('\n'):
+                    code += '\n'
+            return code.rstrip('\n')  # Remove trailing newline
         
         tensor_name = tensor_node.children[0].value
         tensor_type = tensor_node.node_type
@@ -1837,8 +1922,8 @@ def {kernel_name}(
         else:
             operand = self._generate_node(child)
         
-        # For exp operation, convert input to float32
-        if op == "tl.exp":
+        # For exp, sqrt, and sigmoid operations, convert input to float32
+        if op in ["tl.exp", "tl.sqrt", "tl.sigmoid"]:
             return f"{op}({operand}.to(tl.float32)).to(tl.float16)"
         else:
             return f"{op}({operand}).to(tl.float16)"
@@ -1936,7 +2021,7 @@ def {kernel_name}(
         
         if child.node_type == NodeType.LOAD and hasattr(child, 'temp_var'):
             # Use the temp variable if it was already generated
-            return f"tl.sum({child.temp_var}, axis={axis}, dtype=tl.float16)"
+            return f"tl.sum({child.temp_var}, axis={axis})"
         else:
             # Generate the child expression
             tensor = self._generate_node(child)
@@ -2392,7 +2477,7 @@ def {kernel_name}(
             child = node.children[0]
             axis = self._generate_node(node.children[1])
             if child.node_type == NodeType.LOAD and hasattr(child, 'temp_var'):
-                return f"tl.sum({child.temp_var}, axis={axis}, dtype=tl.float16)"
+                return f"tl.sum({child.temp_var}, axis={axis})"
             else:
                 child_expr = self._generate_node_without_loads(child)
                 return f"tl.sum({child_expr}, axis={axis}, dtype=tl.float16)"

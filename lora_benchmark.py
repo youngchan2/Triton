@@ -82,9 +82,9 @@ class LoRABenchmark:
         for name, shape in self.tensor_shapes.items():
             if name in ['O', 'C', 'D', 'E']:  # Output and intermediate tensors
                 # Initialize to zero since they're used as accumulators or outputs
-                self.tensors[name] = torch.zeros(shape, dtype=torch.float32, device=self.device)
+                self.tensors[name] = torch.zeros(shape, dtype=torch.float16, device=self.device)
             else:  # Input tensors
-                self.tensors[name] = torch.randn(shape, dtype=torch.float32, device=self.device)
+                self.tensors[name] = torch.randn(shape, dtype=torch.float16, device=self.device).clamp(-1, 1) * 0.01
     
     def parse_ir_file(self, file_path: str) -> List[Tuple[int, str]]:
         """Parse the IR expressions file and extract all expressions."""
@@ -186,7 +186,7 @@ class LoRABenchmark:
                 else:
                     # Create zero tensor if not exists (for intermediate tensors)
                     if param in self.tensor_shapes:
-                        args.append(torch.zeros(self.tensor_shapes[param], dtype=torch.float32, device=self.device))
+                        args.append(torch.zeros(self.tensor_shapes[param], dtype=torch.float16, device=self.device))
                     else:
                         raise ValueError(f"Unknown tensor parameter: {param}")
             
@@ -518,6 +518,16 @@ def print_comprehensive_report(all_results, top_k):
         print(f"   Block Config: block_n={result.block_config['block_n']}, block_p={result.block_config['block_p']}")
         print(f"   Expression: {result.ir_expression[:100]}...")
 
+def print_ref(tensor_config):
+    for _, config in enumerate(tensor_config):
+        M = config['M']
+        N = config['N']
+        P = config['P']
+        R = config['R']
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    torch.cuda.set_device(device)
+    dtype = torch.float16
 
 def main():
     """Main function to run LoRA IR benchmarks."""
@@ -557,6 +567,7 @@ def main():
     parser.add_argument('--start', type=int, default=START_EXPRESSIONS, help="Start index for expressions")
     parser.add_argument('--num', type=int, default=NUM_EXPRESSIONS, help="Number of expressions to benchmark")
     parser.add_argument('--topk', type=int, default=TOP_K, help="Number of top kernels to report")
+    parser.add_argument('--all', action='store_true', help="Run all configurations comprehensively")
     
     # Add options to customize tensor and block configs
     # parser.add_argument('--tensor-configs', type=str, help="JSON file with tensor configurations")
@@ -564,6 +575,13 @@ def main():
 
     args = parser.parse_args()
     
+    total_expressions = 0
+    if args.all:
+        with open(args.ir, 'r') as f:
+            total_expressions = len(f.readlines())
+    else:
+        total_expressions = args.num
+
     # Load custom configurations if provided
     # if args.tensor_configs:
         # with open(args.tensor_configs, 'r') as f:
@@ -585,7 +603,7 @@ def main():
         BLOCK_CONFIGS, 
         args.ir, 
         args.start, 
-        args.num, 
+        total_expressions,
         args.topk,
         args.output  # Pass output file for incremental saving
     )

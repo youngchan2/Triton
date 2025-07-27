@@ -18,4 +18,5 @@
     - [x] Need to optimize the number of argument of kernel   
     - [x] Determine how to apply the tensor information with external file   
     - [x] Evaluation for the various computation  
+    - [x] Handle multiple tensors in one `input`&`tensor` operators.
     - [ ] Determine how to apply mixed precision

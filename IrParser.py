@@ -14,8 +14,8 @@ class IRParser:
         """Tokenize the IR code"""
         # Remove comments and extra whitespace
         code = re.sub(r';.*', '', code)  # Remove comments
-        # Split by parentheses and whitespace, keeping parentheses
-        tokens = re.findall(r'\(|\)|[^\s()]+', code)
+        # Split by parentheses, commas, and whitespace, keeping parentheses and commas
+        tokens = re.findall(r'\(|\)|,|[^\s(),]+', code)
         return [t for t in tokens if t.strip()]
     
     def parse(self, code: str) -> ASTNode:
@@ -58,8 +58,37 @@ class IRParser:
         self.pos += 1
         
         children = []
-        while self.pos < len(self.tokens) and self.tokens[self.pos] != ')':
-            children.append(self.parse_expression())
+        
+        # Special handling for tensor, input, output operators with comma-separated names
+        if op in ['tensor', 'input', 'output']:
+            # Collect all tokens until we hit a non-comma token or ')'
+            names = []
+            while self.pos < len(self.tokens) and self.tokens[self.pos] != ')':
+                if self.tokens[self.pos] == ',':
+                    self.pos += 1  # Skip comma
+                else:
+                    # This should be a name
+                    names.append(self.tokens[self.pos])
+                    self.pos += 1
+                    # Check if next token is comma
+                    if self.pos < len(self.tokens) and self.tokens[self.pos] == ',':
+                        continue  # Will skip comma in next iteration
+                    else:
+                        break  # No more names
+            
+            # If we have multiple names, wrap them in a special node
+            if len(names) > 1:
+                # Create a list of VAR nodes for the names
+                for name in names:
+                    children.append(ASTNode(NodeType.VAR, [], name))
+            else:
+                # Single name, parse as usual
+                self.pos -= 1  # Back up one position
+                children.append(self.parse_expression())
+        else:
+            # Normal parsing for other operations
+            while self.pos < len(self.tokens) and self.tokens[self.pos] != ')':
+                children.append(self.parse_expression())
         
         if self.pos >= len(self.tokens):
             raise ValueError("Missing closing parenthesis")
