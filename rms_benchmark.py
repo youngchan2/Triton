@@ -14,7 +14,7 @@ import json
 import argparse
 
 from convert_module import convert_ir_to_triton
-from ref_attn import Torch_kernel1, SimpleAttention, TensorRT_kernel
+from ref_attn import TensorRT_kernel_RMSNorm, Torch_kernel1, SimpleAttention
 
 @dataclass
 class BenchmarkResult:
@@ -26,7 +26,7 @@ class BenchmarkResult:
     error: Optional[str] = None
     
     
-class LlamaBenchmark:
+class RMSBenchmark:
     def __init__(self, tensor_config: Dict[str, int]):
         """Initialize benchmark with given tensor configuration."""
         # Extract dimensions from config
@@ -42,11 +42,15 @@ class LlamaBenchmark:
         self.tensor_shapes = {
             # Primary tensors
             'X': (self.M, self.N),
+            'X2': (self.M, ),
+            'X_norm': (self.M, self.N),
             'WQ': (self.N, self.N),
             'WK': (self.N, self.N),
             'WV': (self.N, self.N),
             'K_cache': (self.H, self.P + self.M, self.D),
             'V_cache': (self.H, self.P + self.M, self.D),
+            'K': (1, self.M, self.D),
+            'V': (1, self.M, self.D),
 
             # Output tensors
             'O2': (self.M, self.N),
@@ -71,11 +75,15 @@ class LlamaBenchmark:
         
         self.shape_dict = {
             'X': ('M', 'N'),
+            'X2': ('M',),
+            'X_norm': ('M', 'N'),
             'WQ': ('N', 'N'),
             'WK': ('N', 'N'),
             'WV': ('N', 'N'),
             'K_cache': ('H', 'P+M', 'D'),
             'V_cache': ('H', 'P+M', 'D'),
+            'K': (1, 'M', 'D'),
+            'V': (1, 'M', 'D'),
 
             'O2': ('M', 'N'),
 
@@ -136,7 +144,9 @@ class LlamaBenchmark:
                         try:
                             ir_id = int(id_part)
                             ir_expr = parts[1].strip()
-                            expressions.append((ir_id, ir_expr))
+                            # Skip expressions containing 'dummydata'
+                            if 'dummydata' not in ir_expr:
+                                expressions.append((ir_id, ir_expr))
                         except:
                             continue
                             
@@ -163,7 +173,7 @@ class LlamaBenchmark:
         """Compile Triton kernel code and return callable function."""
         try:
             # Create temporary module file
-            module_name = f"llama_kernel_{kernel_id}"
+            module_name = f"rms_kernel_{kernel_id}"
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
                 f.write(kernel_code)
                 temp_file = f.name
@@ -212,7 +222,8 @@ class LlamaBenchmark:
                                                                      'WK', 'WV', 'WQ',
                                                                      'K_cache', 'V_cache',
                                                                      'C', 'C_sum',
-                                                                     'X', 'O', 'O1', 'O2'])
+                                                                     'X', 'X2', 'X_norm',
+                                                                     'O', 'O1', 'O2'])
             kernel_fn = kernel_module.forward
             
             # Reset output tensor to zero for each benchmark
@@ -232,7 +243,7 @@ class LlamaBenchmark:
                         raise ValueError(f"Unknown tensor parameter: {param}")
             
             # Add block parameters from config
-            # block_n = block_sizes.get('block_n', 16)
+            # block_p = block_sizes.get('block_p', 16)
             block_k = block_sizes.get('block_k', 16)
             block_p = block_sizes.get('block_p', 16)
             
@@ -289,7 +300,7 @@ class LlamaBenchmark:
             self.cleanup_gpu()
             
             # Also clean up the loaded module to prevent memory leaks
-            module_name = f"llama_kernel_{ir_id}"
+            module_name = f"rms_kernel_{ir_id}"
             if module_name in sys.modules:
                 del sys.modules[module_name]
             
@@ -415,9 +426,8 @@ def run_comprehensive_benchmark(tensor_configs, block_configs, ir_file, start_ex
         print(f"\nTensor Configuration {tensor_idx + 1}/{len(tensor_configs)}: M={tensor_config['M']}, N={tensor_config['N']}, D={tensor_config['D']}, H={tensor_config['H']}, P={tensor_config['P']}")
         
         # Initialize benchmark with this tensor configuration
-        benchmark = LlamaBenchmark(tensor_config)
+        benchmark = RMSBenchmark(tensor_config)
         benchmark_instances.append(benchmark)
-
         for block_idx, block_config in enumerate(block_configs):
             print(f"  Block Configuration {block_idx + 1}/{len(block_configs)}: block_p={block_config['block_p']}, block_k={block_config['block_k']}")
             
@@ -582,7 +592,7 @@ def print_ref(tensor_config, benchmark_instances):
         P = config['P']
         H = config['H']
 
-        device = torch.device('cuda:3' if torch.cuda.is_available() else 'cpu')
+        device = torch.device('cuda:2' if torch.cuda.is_available() else 'cpu')
         torch.cuda.set_device(device)
         
         ITER = 100
@@ -599,7 +609,7 @@ def print_ref(tensor_config, benchmark_instances):
         cache_V = cache_V_benchmark.permute(1, 0, 2).unsqueeze(0)  # (H, P+M, D) -> (P+M, H, D) -> (1, P+M, H, D)
 
         print("\nTesting TensorRT...")
-        block = TensorRT_kernel(M, N, D, H, cache_K, cache_V, P).cuda()
+        block = TensorRT_kernel_RMSNorm(M, N, D, H, cache_K, cache_V, P).cuda()
         block.half()
         with torch.no_grad():
             for _ in range(10):
@@ -669,10 +679,10 @@ def print_ref(tensor_config, benchmark_instances):
 def main():
     """Main function to run Attacc IR benchmarks."""
     # Configuration
-    IR_FILE = "./benchmark_llama/llama7b_attacc_cost3_kern2.txt"
-    OUTPUT_FILE = "./benchmark_llama/benchmark_llama_A40.json"
-    TENSOR_FILE = "./benchmark_llama/tensor_configs.json"
-    BLOCK_FILE = "./benchmark_llama/block_configs.json"
+    IR_FILE = "./benchmark_rmsnorm_falcon/falcon7b_rmsnorm_qkv_attn_cost6_kern1_wo_scheduler.txt"
+    OUTPUT_FILE = "./benchmark_rmsnorm_falcon/benchmark_rms_4090.json"
+    TENSOR_FILE = "./benchmark_rmsnorm_falcon/tensor_configs.json"
+    BLOCK_FILE = "./benchmark_rmsnorm_falcon/block_configs.json"
     START_EXPRESSIONS = 0
     NUM_EXPRESSIONS = 10  # Reduced for testing multiple configurations
     TOP_K = 5  # Number of best kernels to report
@@ -689,11 +699,11 @@ def main():
     
     # Define block size candidates
     # BLOCK_CONFIGS = [
-    #     {'block_n': 16, 'block_k': 16},    # Small blocks
-    #     {'block_n': 32, 'block_k': 32},    # Medium blocks
-    #     {'block_n': 64, 'block_k': 64},    # Large blocks
-    #     {'block_n': 16, 'block_k': 32},    # Mixed blocks
-    #     {'block_n': 32, 'block_k': 16},    # Mixed blocks (reversed)
+    #     {'block_p': 16, 'block_k': 16},    # Small blocks
+    #     {'block_p': 32, 'block_k': 32},    # Medium blocks
+    #     {'block_p': 64, 'block_k': 64},    # Large blocks
+    #     {'block_p': 16, 'block_k': 32},    # Mixed blocks
+    #     {'block_p': 32, 'block_k': 16},    # Mixed blocks (reversed)
     # ]
     with open(BLOCK_FILE, 'r') as f:
         BLOCK_CONFIGS = json.load(f)

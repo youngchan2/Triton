@@ -21,6 +21,9 @@ class SimpleAttention(nn.Module):
         self.P = P
         self.H = N // D
 
+        self.weight = nn.Parameter(torch.ones(self.N))
+        self.W_total = nn.Linear(self.N, 3*self.N, bias=False)
+
         # Random Q, K, V for testing
         self.q = torch.randn((self.H, M, D), device='cuda', dtype=torch.float16)
         self.cache_K = cache_K  # (H, P+M, D)
@@ -29,6 +32,15 @@ class SimpleAttention(nn.Module):
     def forward(self, X):
         scale_factor = 1.0 / math.sqrt(self.D)
         
+
+        X_norm = F.rms_norm(X, normalized_shape=(self.N,), weight=self.weight)
+        
+        qkv = self.W_total(X_norm)
+        q, k, v = torch.split(qkv, self.N, dim=1)
+        q = q.view(1, self.M, self.H, self.D)
+        k = k.view(1, self.M, self.H, self.D)
+        v = v.view(1, self.M, self.H, self.D)
+
         # Compute attention for each head
         output_heads = []
         for h in range(self.H):
@@ -49,17 +61,20 @@ class Torch_kernel1(nn.Module):
         self.D = D
         self.num_heads = num_heads
 
-        self.W_total = nn.Linear(H, 3*H, bias=False)
+        self.weight = nn.Parameter(torch.ones(self.H))
+        self.W_total = nn.Linear(self.H, 3*self.H, bias=False)
 
         self.cache_K = cache_K 
         self.cache_V = cache_V
 
         self.context_length = context_length
-    
+
     def forward(self, X):
         seq_len, H = X.size()
+        
+        X_norm = F.rms_norm(X, normalized_shape=(self.H,), weight=self.weight)
 
-        qkv = self.W_total(X)
+        qkv = self.W_total(X_norm)
         q, k, v = torch.split(qkv, H, dim=1)
         q = q.view(1, seq_len, self.num_heads, self.D)
         k = k.view(1, seq_len, self.num_heads, self.D)

@@ -20,6 +20,7 @@ class TritonCodeGen:
         self.intermediate_tensors = set()  # Track intermediate tensors (input tensors used in store)
         self.generated_kernels = []  # List of (kernel_name, kernel_code, tensors_used, parallel_dims)
         self.cross_kernel_tensors = set()  # Track tensors that cross kernel boundaries
+        self.cross_sloop_memory_tensors = set()  # Track cross-sloop tensors that need memory storage
         self.stored_tensor_dims = {}  # Track which tensors are stored in parallel loops: loop_var -> [(tensor, dim)]
         self.load_cache = {}  # Cache for load operations: (tensor_name, offset_expr) -> temp_var
         self.constants = {}  # Map variable names (e.g., 'N', 'M') to their constant values
@@ -122,16 +123,24 @@ class TritonCodeGen:
             # Generate single kernel with wrapper function
             all_code = ""
             
+            # First, generate the kernel to collect block parameters
+            kernel_name = "kernel_0"
+            kernel_code = self._generate_single_kernel(ast, kernel_name=kernel_name)
+            
+            # Collect block parameters from all_loops
+            block_params = []
+            for loop_var, _, _, tile_size in self.all_loops:
+                if isinstance(tile_size, str) and not tile_size.isdigit():
+                    block_params.append(f"BLOCK_{loop_var.upper()}")
+            
             # Generate import statements once
             all_code += """import triton
 import triton.language as tl
 import torch
-
 """
-            
-            # Generate the single kernel
-            kernel_name = "kernel_0"
-            kernel_code = self._generate_single_kernel(ast, kernel_name=kernel_name)
+            # Generate autotune decorator only if there are block parameters
+            if block_params:
+                all_code += "\n" + self._generate_autotune_decorator(block_params) + "\n"
             
             # Remove the import statements from kernel (they're already at the top)
             kernel_code = kernel_code.replace("import triton\nimport triton.language as tl\nimport torch\n\n", "")
@@ -145,11 +154,14 @@ import torch
                 self.tensors_used.copy(),
                 self.parallel_dims.copy(),
                 self.all_loops.copy(),
-                self.stored_tensor_dims.copy()
+                self.stored_tensor_dims.copy(),
+                self.intermediate_tensors.copy()  # Add intermediate tensors info
             ))
             
             # Generate wrapper function
-            all_code += self._generate_wrapper_function()
+            # For single kernel, local intermediate tensors are just the intermediate tensors
+            local_intermediate_tensors = self.intermediate_tensors - self.cross_kernel_tensors
+            all_code += self._generate_wrapper_function(local_intermediate_tensors)
             
             return all_code
     
@@ -192,21 +204,44 @@ import torch
         all_code += """import triton
 import triton.language as tl
 import torch
-
 """
         
         # Flatten all nested seq nodes
         operations = self._flatten_seq(seq_node)
         
-        # Generate a kernel for each operation
+        # Track all intermediate tensors across all kernels
+        all_local_intermediate_tensors = set()
+        
+        # Generate kernels with individual autotune decorators
         for i, op in enumerate(operations):
             kernel_name = f"kernel_{i}"
+            
+            # Reset state before processing each operation
+            self.intermediate_tensors = set()
+            self.tensors_used = set()
+            
+            # Collect intermediate tensors for this operation
+            self._collect_intermediate_tensors(op, in_ploop=False, ploop_var=None)
+            
+            # Identify cross-sloop memory tensors for this specific operation
+            cross_sloop_memory_tensors = self._identify_cross_sloop_memory_tensors(op)
+            
+            # Identify accumulators
+            accumulators = self._identify_accumulators(op)
+            
+            # Remove accumulators from cross-sloop memory tensors
+            # Accumulators should stay as register-based intermediate tensors
+            cross_sloop_memory_tensors -= accumulators
+            
+            self.intermediate_tensors -= cross_sloop_memory_tensors
+            self.tensors_used.update(cross_sloop_memory_tensors)
+            self.cross_sloop_memory_tensors = cross_sloop_memory_tensors
+            
+            # Track local intermediate tensors (allocated with tl.zeros in kernel)
+            local_intermediate_tensors = self.intermediate_tensors - self.cross_kernel_tensors - cross_sloop_memory_tensors
+            all_local_intermediate_tensors.update(local_intermediate_tensors)
+            
             kernel_code = self._generate_single_kernel(op, kernel_name=kernel_name)
-            
-            # Remove the import statements from individual kernels (they're already at the top)
-            kernel_code = kernel_code.replace("import triton\nimport triton.language as tl\nimport torch\n\n", "")
-            
-            all_code += kernel_code + "\n\n"
             
             # Store kernel info for wrapper generation
             self.generated_kernels.append((
@@ -215,22 +250,37 @@ import torch
                 self.tensors_used.copy(),
                 self.parallel_dims.copy(),
                 self.all_loops.copy(),
-                self.stored_tensor_dims.copy()
+                self.stored_tensor_dims.copy(),
+                self.intermediate_tensors.copy()  # Add intermediate tensors info
             ))
+            
+            # Collect block parameters for this specific kernel
+            kernel_block_params = []
+            for loop_var, _, _, tile_size in self.all_loops:
+                if isinstance(tile_size, str) and not tile_size.isdigit():
+                    kernel_block_params.append(f"BLOCK_{loop_var.upper()}")
+            
+            # Add autotune decorator for this kernel if it has block parameters
+            if kernel_block_params:
+                all_code += "\n" + self._generate_autotune_decorator(kernel_block_params) + "\n"
+            
+            # Remove the import statements from kernel
+            kernel_code = kernel_code.replace("import triton\nimport triton.language as tl\nimport torch\n\n", "")
+            all_code += kernel_code + "\n\n"
         
         # Generate wrapper function
-        all_code += self._generate_wrapper_function()
+        all_code += self._generate_wrapper_function(all_local_intermediate_tensors)
         
         return all_code
     
-    def _generate_wrapper_function(self) -> str:
+    def _generate_wrapper_function(self, all_local_intermediate_tensors: set) -> str:
         """Generate a wrapper function that calls all kernels sequentially"""
         # Collect all unique tensors used across all kernels
         all_tensors = set()
         # Collect all unique block parameters needed
         all_block_params = set()
         
-        for _, _, tensors_used, _, all_loops, _ in self.generated_kernels:
+        for _, _, tensors_used, _, all_loops, _, _ in self.generated_kernels:
             all_tensors.update(tensors_used)
             # Collect block parameters from loops
             for loop_var, _, _, tile_size in all_loops:
@@ -242,11 +292,11 @@ import torch
         # Filter tensors to only include:
         # 1. Output tensors
         # 2. Input tensors that appear in load operations (not intermediate)
-        # This excludes intermediate tensors that are not cross-kernel
+        # This excludes local intermediate tensors that are allocated inside kernels
         forward_params = []
         for tensor_name in sorted(all_tensors):
-            # Include if it's not an intermediate tensor, or if it's a cross-kernel tensor
-            if tensor_name not in self.intermediate_tensors or tensor_name in self.cross_kernel_tensors:
+            # Exclude local intermediate tensors (allocated with tl.zeros inside kernels)
+            if tensor_name not in all_local_intermediate_tensors:
                 forward_params.append(tensor_name)
         
         # Generate metadata for benchmark.py
@@ -271,7 +321,7 @@ import torch
         code += '    """\n'
         
         # Call each kernel
-        for kernel_name, _, tensors_used, parallel_dims, all_loops, stored_tensor_dims in self.generated_kernels:
+        for kernel_name, _, tensors_used, parallel_dims, all_loops, stored_tensor_dims, intermediate_tensors in self.generated_kernels:
             # Calculate grid size for this kernel
             if parallel_dims:
                 grid_parts = []
@@ -353,7 +403,7 @@ import torch
             kernel_params = []
             
             # First, add parameters for non-intermediate tensors (in sorted order)
-            non_intermediate_tensors = sorted([t for t in tensors_used if t not in self.intermediate_tensors or t in self.cross_kernel_tensors])
+            non_intermediate_tensors = sorted([t for t in tensors_used if t not in intermediate_tensors or t in self.cross_kernel_tensors])
             for tensor in non_intermediate_tensors:
                 # Pointer
                 kernel_params.append(f"        {tensor}")
@@ -371,20 +421,43 @@ import torch
             
             # NO shape parameters for local intermediate tensors - using constants instead
             
-            # Add block size parameters for all loops
+            code += ",\n".join(kernel_params)
+            
+            # Collect autotune block parameters that this specific kernel uses
+            kernel_autotuned_blocks = set()
             for loop_var, _, _, tile_size in all_loops:
                 if isinstance(tile_size, str) and not tile_size.isdigit():
-                    # Use block parameter variable
-                    kernel_params.append(f"        block_{loop_var}")
+                    kernel_autotuned_blocks.add(f"BLOCK_{loop_var.upper()}")
+            
+            # Add comment about autotune parameters if any
+            if kernel_autotuned_blocks:
+                sorted_autotuned = sorted(list(kernel_autotuned_blocks))
+                code += f",\n        # {', '.join(sorted_autotuned)} are provided by autotune"
+            
+            # Add block size parameters and constants as keyword arguments
+            keyword_params = []
+            
+            # Add block size parameters for all loops
+            for loop_var, _, _, tile_size in all_loops:
+                block_param_name = f"BLOCK_{loop_var.upper()}"
+                if isinstance(tile_size, str) and not tile_size.isdigit():
+                    # Skip if this parameter is in autotune
+                    if block_param_name in kernel_autotuned_blocks:
+                        keyword_params.append(f"        # {block_param_name} is automatically set by autotune")
+                    else:
+                        # Use block parameter variable as keyword argument
+                        keyword_params.append(f"        {block_param_name}=block_{loop_var}")
                 else:
-                    # Use numeric value
-                    kernel_params.append(f"        {tile_size}")
+                    # Use numeric value for fixed block sizes
+                    keyword_params.append(f"        {block_param_name}={tile_size}")
             
-            # Add constant values
+            # Add constant values as keyword arguments
             for const_name in sorted(self.constants.keys()):
-                kernel_params.append(f"        {self.constants[const_name]}")
+                keyword_params.append(f"        {const_name}={self.constants[const_name]}")
             
-            code += ",\n".join(kernel_params)
+            if keyword_params:
+                code += ",\n" + ",\n".join(keyword_params)
+            
             code += "\n    )\n\n"
         
         code += "    # Return output tensors if needed\n"
@@ -393,8 +466,68 @@ import torch
         
         return code
     
+    def _generate_autotune_decorator(self, block_params: list) -> str:
+        """Generate autotune decorator with configurations based on actual block parameters"""
+        if not block_params:
+            return ""
+        
+        # Generate power-of-2 values for each parameter
+        values = [32, 64, 128]
+        
+        # Generate configurations
+        configs = []
+        
+        if len(block_params) == 1:
+            # Single parameter
+            for val in values:
+                config_dict = {block_params[0]: val}
+                config_str = "{" + ", ".join([f"'{k}': {v}" for k, v in config_dict.items()]) + "}"
+                configs.append(f"        triton.Config({config_str})")
+        elif len(block_params) == 2:
+            # Two parameters - generate combinations
+            for val1 in values:
+                for val2 in values:
+                    config_dict = {block_params[0]: val1, block_params[1]: val2}
+                    # Format as string with quotes around keys
+                    config_str = "{" + ", ".join([f"'{k}': {v}" for k, v in config_dict.items()]) + "}"
+                    configs.append(f"        triton.Config({config_str})")
+        else:
+            # More than 2 parameters - generate a reasonable subset of combinations
+            # Start with all parameters having the same value
+            for val in values:
+                config_dict = {param: val for param in block_params}
+                config_str = "{" + ", ".join([f"'{k}': {v}" for k, v in config_dict.items()]) + "}"
+                configs.append(f"        triton.Config({config_str})")
+            
+            # Add some mixed configurations
+            # Generate a few more strategic combinations
+            if len(block_params) >= 3:
+                # Add configurations where first param is different
+                for val1 in [32, 64]:
+                    for val2 in [64, 128]:
+                        config_dict = {block_params[0]: val1}
+                        for i in range(1, len(block_params)):
+                            config_dict[block_params[i]] = val2
+                        config_str = "{" + ", ".join([f"'{k}': {v}" for k, v in config_dict.items()]) + "}"
+                        config = f"        triton.Config({config_str})"
+                        if config not in configs:
+                            configs.append(config)
+        
+        # Limit to reasonable number of configs
+        if len(configs) > 16:
+            configs = configs[:16]
+        
+        decorator = "@triton.autotune(\n    configs = [\n"
+        decorator += ",\n".join(configs)
+        decorator += "\n    ], key=[]\n)"
+        
+        return decorator
+    
     def _generate_single_kernel(self, ast: ASTNode, kernel_name: str = "kernel") -> str:
         """Generate a single Triton kernel from AST"""
+        # Save cross_sloop_memory_tensors before reset
+        saved_cross_sloop_memory_tensors = getattr(self, 'cross_sloop_memory_tensors', set()).copy()
+        
         # Reset state for this kernel
         self.parallel_dims = []
         self.all_loops = []
@@ -404,6 +537,9 @@ import torch
         self.offset_counter = 0
         self.loop_var_to_tensor_dim = {}
         self.loop_vars = {}
+        
+        # Restore cross_sloop_memory_tensors
+        self.cross_sloop_memory_tensors = saved_cross_sloop_memory_tensors
         self.stored_tensor_dims = {}
         self.load_cache = {}  # Reset load cache for each kernel
         self.intermediate_tensor_indices = {}  # Reset intermediate tensor indices
@@ -466,6 +602,7 @@ import torch
 
                         # Tensor operators represent intermediate tensors
                         # These need to be initialized with tl.zeros
+                        # But not if they need memory storage due to cross-sloop access patterns
                         self.intermediate_tensors.add(tensor_name)
                         
                         # Infer shape from the store's index using existing tensor shapes
@@ -738,6 +875,107 @@ import torch
                 cross_sloop_tensors.add(tensor_name)
         
         return cross_sloop_tensors
+    
+    def _identify_cross_sloop_memory_tensors(self, ast: ASTNode) -> set:
+        """Identify cross-sloop tensors that need memory storage due to different index patterns"""
+        memory_tensors = set()
+        tensor_index_patterns = {}  # tensor_name -> {sloop_id -> index_pattern}
+        sloop_counter = [0]
+        
+        def extract_index_pattern(index_node: ASTNode) -> str:
+            """Extract a simplified representation of index pattern"""
+            if not index_node or index_node.node_type != NodeType.INDEX:
+                return ""
+            
+            pattern_parts = []
+            for child in index_node.children:
+                if child.node_type == NodeType.TILE:
+                    if child.children and child.children[0].node_type == NodeType.VAR:
+                        # This is a tile with loop variable
+                        pattern_parts.append(f"tile_{child.children[0].value}")
+                    else:
+                        pattern_parts.append("tile")
+                elif child.node_type == NodeType.FULLTILE:
+                    pattern_parts.append("fulltile")
+                elif child.node_type == NodeType.ELEM:
+                    if child.children and child.children[0].node_type == NodeType.VAR:
+                        pattern_parts.append(f"elem_{child.children[0].value}")
+                    else:
+                        pattern_parts.append("elem")
+                else:
+                    pattern_parts.append(str(child.node_type))
+            
+            return "_".join(pattern_parts)
+        
+        def collect_tensor_patterns(node: ASTNode, current_sloop_id: int = -1):
+            """Collect index patterns for tensor accesses"""
+            if node.node_type == NodeType.SLOOP:
+                sloop_counter[0] += 1
+                new_sloop_id = sloop_counter[0]
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        collect_tensor_patterns(child, new_sloop_id)
+            elif node.node_type in [NodeType.STORE, NodeType.LOAD]:
+                tensor_node = node.children[0] if node.children else None
+                if tensor_node and tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
+                    # Get index node
+                    index_node = None
+                    if node.node_type == NodeType.STORE and len(node.children) > 2:
+                        index_node = node.children[2]
+                    elif node.node_type == NodeType.LOAD and len(node.children) > 1:
+                        index_node = node.children[1]
+                        # Handle case where fulltile is directly a child (not wrapped in index)
+                        if index_node and index_node.node_type == NodeType.FULLTILE:
+                            # Create a synthetic index node
+                            synthetic_index = ASTNode(NodeType.INDEX, [index_node])
+                            index_node = synthetic_index
+                    
+                    if index_node and current_sloop_id != -1:
+                        pattern = extract_index_pattern(index_node)
+                        for child in tensor_node.children:
+                            if child.node_type == NodeType.VAR:
+                                tensor_name = child.value
+                                if tensor_name not in tensor_index_patterns:
+                                    tensor_index_patterns[tensor_name] = {}
+                                if current_sloop_id not in tensor_index_patterns[tensor_name]:
+                                    tensor_index_patterns[tensor_name][current_sloop_id] = set()
+                                tensor_index_patterns[tensor_name][current_sloop_id].add(pattern)
+                
+                # Continue traversing
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        collect_tensor_patterns(child, current_sloop_id)
+            else:
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        collect_tensor_patterns(child, current_sloop_id)
+        
+        collect_tensor_patterns(ast)
+        
+        # Find tensors with different patterns across sloops
+        for tensor_name, sloop_patterns in tensor_index_patterns.items():
+            if len(sloop_patterns) > 1:
+                # Collect all unique patterns across different sloops
+                all_patterns = set()
+                for patterns in sloop_patterns.values():
+                    all_patterns.update(patterns)
+                
+                # If there are different patterns, this tensor needs memory storage
+                if len(all_patterns) > 1:
+                    memory_tensors.add(tensor_name)
+                    # Check if patterns involve different tile variables
+                    tile_vars = set()
+                    for pattern in all_patterns:
+                        if "tile_" in pattern:
+                            # Extract tile variable names
+                            import re
+                            matches = re.findall(r'tile_(\w+)', pattern)
+                            tile_vars.update(matches)
+                    if len(tile_vars) > 1:
+                        # Different tile variables used - definitely needs memory
+                        memory_tensors.add(tensor_name)
+        
+        return memory_tensors
 
     def _identify_sloop_intermediate_tensors(self, ast: ASTNode) -> set:
         """Identify intermediate tensors that are defined inside sloop"""
@@ -944,8 +1182,8 @@ import torch
     
     def _generate_intermediate_allocations(self, ast: ASTNode = None) -> str:
         """Generate tl.zeros allocations for intermediate tensors"""
-        # Only allocate intermediate tensors that are NOT cross-kernel tensors
-        local_intermediates = self.intermediate_tensors - self.cross_kernel_tensors
+        # Only allocate intermediate tensors that are NOT cross-kernel tensors and NOT cross-sloop memory tensors
+        local_intermediates = self.intermediate_tensors - self.cross_kernel_tensors - self.cross_sloop_memory_tensors
         
         # Track temporary variables that will be created for sloop non-accumulation stores
         sloop_temp_vars_shapes = {}
@@ -959,14 +1197,29 @@ import torch
         cross_sloop_tensors = set()
         # Identify intermediate tensors that are defined inside sloop
         sloop_intermediate_tensors = set()
+        # Identify cross-sloop tensors that need memory storage
+        cross_sloop_memory_tensors = set()
         if ast:
             accumulators = self._identify_accumulators(ast)
             cross_sloop_tensors = self._identify_cross_sloop_tensors(ast)
             sloop_intermediate_tensors = self._identify_sloop_intermediate_tensors(ast)
+            cross_sloop_memory_tensors = self._identify_cross_sloop_memory_tensors(ast)
             
             # Identify tensors that will need temp vars in sloop
             sloop_tensors_no_loop_var = self._identify_sloop_intermediate_tensors_without_loop_var(ast)
             temp_counter_saved = self.temp_counter
+            
+            # Remove accumulators from cross-sloop memory tensors
+            # Accumulators should stay as register-based intermediate tensors
+            cross_sloop_memory_tensors -= accumulators
+            
+            # Remove cross-sloop memory tensors from intermediate tensors
+            # They need to be treated as real tensors with memory allocation
+            self.intermediate_tensors -= cross_sloop_memory_tensors
+            # Add them to tensors_used instead
+            self.tensors_used.update(cross_sloop_memory_tensors)
+            # Store for later use in generate_store
+            self.cross_sloop_memory_tensors = cross_sloop_memory_tensors
             
             # Check each sloop individually for accumulation patterns
             for tensor_name in sloop_tensors_no_loop_var:
@@ -1122,8 +1375,8 @@ import torch
         # Generate Triton kernel function header with only stride parameters (no shape)
         params = []
         for name in sorted(self.tensors_used):
-            # Skip intermediate tensors that are NOT cross-kernel tensors
-            if name in self.intermediate_tensors and name not in self.cross_kernel_tensors:
+            # Skip intermediate tensors that are NOT cross-kernel tensors and NOT cross-sloop memory tensors
+            if name in self.intermediate_tensors and name not in self.cross_kernel_tensors and name not in self.cross_sloop_memory_tensors:
                 continue
                 
             # pointer
@@ -1407,8 +1660,10 @@ def {kernel_name}(
             node.temp_var = self.sloop_temp_vars[tensor_name]
             return ""
         
-        # Check if this is a local intermediate tensor (not cross-kernel)
-        if tensor_name in self.intermediate_tensors and tensor_name not in self.cross_kernel_tensors:
+        # Check if this is a local intermediate tensor (not cross-kernel and not cross-sloop memory)
+        if (tensor_name in self.intermediate_tensors and 
+            tensor_name not in self.cross_kernel_tensors and
+            not (hasattr(self, 'cross_sloop_memory_tensors') and tensor_name in self.cross_sloop_memory_tensors)):
             # For local intermediate tensors, directly reference without reshape
             # tl.dot can handle 3D tensors with batch dimension
             node.temp_var = tensor_name
@@ -1680,8 +1935,11 @@ def {kernel_name}(
         # Use proper indentation based on current context
         indent_str = '    ' * self.indent_level
         
-        # Check if this is an output tensor, input tensor, or cross-kernel intermediate tensor
-        if tensor_type == NodeType.OUTPUT or tensor_type == NodeType.INPUT or (tensor_type == NodeType.TENSOR and tensor_name in self.cross_kernel_tensors):
+        # Check if this is an output tensor, input tensor, cross-kernel intermediate tensor, or cross-sloop memory tensor
+        if (tensor_type == NodeType.OUTPUT or 
+            tensor_type == NodeType.INPUT or 
+            (tensor_type == NodeType.TENSOR and tensor_name in self.cross_kernel_tensors) or
+            (tensor_type == NodeType.TENSOR and hasattr(self, 'cross_sloop_memory_tensors') and tensor_name in self.cross_sloop_memory_tensors)):
             # For output tensors, input tensors, and cross-kernel intermediates, use tl.store
             offset_expr = self._generate_index(index_node, tensor_name)
             
