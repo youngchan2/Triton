@@ -24,9 +24,157 @@ class TritonCodeGen:
         self.stored_tensor_dims = {}  # Track which tensors are stored in parallel loops: loop_var -> [(tensor, dim)]
         self.load_cache = {}  # Cache for load operations: (tensor_name, offset_expr) -> temp_var
         self.constants = {}  # Map variable names (e.g., 'N', 'M') to their constant values
+        self.mask_counter = 0  # Counter for unique mask variables
+        self.generated_masks = {}  # Cache for already generated masks: (tile_vars) -> mask_var_name
+        self.intermediate_tensor_indices = {}  # Track index patterns for intermediate tensors
+        self.kernel_accumulators = set()  # Track accumulators that need special handling
         self.sloop_temp_vars = {}  # Map tensor_name -> temp_var_name for sloop non-accumulation stores
         self.current_sloop_info = None  # Track current sloop context: (loop_var, sloop_node)
+        self.output_tensors = set()  # Track output tensors
+        self.mask_scope_level = {}  # Track the scope level where each mask was defined
+        self.indices_scope_level = {}  # Track the scope level where each indices var was defined
+        self.generated_indices = {}  # Track already generated indices: loop_var -> indices_var_name
+        self.loop_instance_counter = 0  # Track unique loop instances
+        self.current_loop_instance = None  # Current loop instance ID
+        self.mask_loop_instance = {}  # Track which loop instance each mask belongs to
+        self.indices_loop_instance = {}  # Track which loop instance each indices var belongs to
         
+    def _generate_mask_for_index(self, index_node: ASTNode, tensor_name: str) -> tuple:
+        """Generate mask code for tensor access if needed
+        Returns: (mask_code, mask_var_name or None)
+        """
+        # Debug
+        # print(f"DEBUG: _generate_mask_for_index called for tensor={tensor_name}, index_children={[c.node_type for c in index_node.children]}")
+        
+        # Collect tiles that need masking
+        tiles_needing_mask = []
+        
+        for i, child in enumerate(index_node.children):
+            if child.node_type == NodeType.TILE:
+                loop_var = child.children[0].value
+                if loop_var in self.loop_vars:
+                    # Check if we need mask for this dimension
+                    if tensor_name in self.tensor_shapes and i < len(self.tensor_shapes[tensor_name]):
+                        dim_size = self.tensor_shapes[tensor_name][i]
+                        # Check if dimension size is known and not divisible by block size
+                        if isinstance(dim_size, (int, float)):
+                            block_param = f"BLOCK_{loop_var.upper()}"
+                            # We need mask if size is not divisible by block
+                            # But we can't check this at code generation time with symbolic BLOCK_K
+                            # So we always generate mask for safety when using tiles
+                            tiles_needing_mask.append((loop_var, i, block_param, dim_size))
+                        elif isinstance(dim_size, str):
+                            # Symbolic dimension - always need mask for safety
+                            block_param = f"BLOCK_{loop_var.upper()}"
+                            tiles_needing_mask.append((loop_var, i, block_param, dim_size))
+        
+        if not tiles_needing_mask:
+            return "", None
+        
+        # Generate mask code
+        indent_str = '    ' * self.indent_level
+        mask_code = ""
+        mask_conditions = []
+        
+        # Check if we've already generated this mask combination
+        mask_key = tuple((loop_var, dim_idx) for loop_var, dim_idx, _, _ in tiles_needing_mask)
+        if mask_key in self.generated_masks:
+            # Check if the mask was defined at a higher or equal scope level
+            existing_mask_var = self.generated_masks[mask_key]
+            existing_scope = self.mask_scope_level.get(existing_mask_var, 0)
+            existing_loop_instance = self.mask_loop_instance.get(existing_mask_var, None)
+            
+            # If the existing mask is at the current scope level or higher (lower number), 
+            # AND it's from the same loop instance (or no loop), reuse it
+            if existing_scope <= self.indent_level and existing_loop_instance == self.current_loop_instance:
+                # print(f"DEBUG: Reusing existing mask {existing_mask_var} for key {mask_key}")
+                return "", existing_mask_var
+            else:
+                # The mask was defined in a deeper scope or different loop instance, need to regenerate
+                # print(f"DEBUG: Mask {existing_mask_var} out of scope or different loop, regenerating")
+                pass
+        
+        # Generate new mask
+        mask_var = f"mask_{self.mask_counter}"
+        self.mask_counter += 1
+        self.generated_masks[mask_key] = mask_var
+        self.mask_scope_level[mask_var] = self.indent_level
+        self.mask_loop_instance[mask_var] = self.current_loop_instance
+        
+        for loop_var, dim_idx, block_param, dim_size in tiles_needing_mask:
+            indices_var = f"{loop_var}_indices"
+            
+            # Check if indices were already generated and are still in scope
+            need_generate_indices = True
+            if loop_var in self.generated_indices:
+                existing_indices_var = self.generated_indices[loop_var]
+                existing_scope = self.indices_scope_level.get(existing_indices_var, 0)
+                existing_loop_instance = self.indices_loop_instance.get(existing_indices_var, None)
+                
+                # If the existing indices are at the current scope level or higher (lower number),
+                # AND from the same loop instance, reuse them
+                if existing_scope <= self.indent_level and existing_loop_instance == self.current_loop_instance:
+                    indices_var = existing_indices_var
+                    need_generate_indices = False
+            
+            # Generate indices if needed
+            if need_generate_indices:
+                mask_code += f"{indent_str}{indices_var} = {loop_var} + tl.arange(0, {block_param})\n"
+                self.generated_indices[loop_var] = indices_var
+                self.indices_scope_level[indices_var] = self.indent_level
+                self.indices_loop_instance[indices_var] = self.current_loop_instance
+            
+            # Add mask condition
+            # dim_size is already the shape value from tensor_shapes
+            mask_conditions.append(f"{indices_var} < {dim_size}")
+        
+        # Combine conditions
+        if len(mask_conditions) == 1:
+            mask_expr = mask_conditions[0]
+        else:
+            # For multi-dimensional masks, we need to handle broadcasting properly
+            if len(tiles_needing_mask) > 1:
+                # Multiple dimensions need masking
+                # Create individual masks with proper broadcasting first
+                individual_masks = []
+                for i, (tile_var, dim_idx, shape_value, comparison_value) in enumerate(tiles_needing_mask):
+                    indices_var = f"{tile_var}_indices"
+                    # Create the comparison
+                    individual_mask = f"({indices_var} < {comparison_value})"
+                    # Add broadcasting based on dimension
+                    broadcast_parts = []
+                    for j in range(len(index_node.children)):
+                        if j == dim_idx:
+                            broadcast_parts.append(":")
+                        else:
+                            broadcast_parts.append("None")
+                    broadcast_str = f"[{', '.join(broadcast_parts)}]"
+                    individual_masks.append(f"{individual_mask}{broadcast_str}")
+                
+                # Combine the broadcasted masks
+                mask_expr = " & ".join(individual_masks)
+            else:
+                mask_expr = " & ".join(f"({cond})" for cond in mask_conditions)
+        
+        # Handle broadcasting for multi-dimensional access
+        num_dims = len(index_node.children)
+        if num_dims > 1 and len(tiles_needing_mask) == 1:
+            # Single dimension mask needs broadcasting
+            tile_var, dim_idx, _, _ = tiles_needing_mask[0]
+            broadcast_parts = []
+            for i in range(num_dims):
+                if i == dim_idx:
+                    broadcast_parts.append(":")
+                else:
+                    broadcast_parts.append("None")
+            
+            mask_broadcast = f"[{', '.join(broadcast_parts)}]"
+            mask_code += f"{indent_str}{mask_var} = ({mask_expr}){mask_broadcast}\n"
+        else:
+            mask_code += f"{indent_str}{mask_var} = {mask_expr}\n"
+        
+        return mask_code, mask_var
+    
     def resolve_value(self, value) -> str:
         """Resolve a value that might be a variable name or expression to its constant value.
         
@@ -125,6 +273,10 @@ class TritonCodeGen:
             
             # First, generate the kernel to collect block parameters
             kernel_name = "kernel_0"
+            
+            # Identify cross-sloop memory tensors for this operation
+            cross_sloop_memory_tensors = self._identify_cross_sloop_memory_tensors(ast)
+            
             kernel_code = self._generate_single_kernel(ast, kernel_name=kernel_name)
             
             # Collect block parameters from all_loops
@@ -155,7 +307,8 @@ import torch
                 self.parallel_dims.copy(),
                 self.all_loops.copy(),
                 self.stored_tensor_dims.copy(),
-                self.intermediate_tensors.copy()  # Add intermediate tensors info
+                self.intermediate_tensors.copy(),  # Add intermediate tensors info
+                cross_sloop_memory_tensors.copy()  # Add cross-sloop memory tensors info
             ))
             
             # Generate wrapper function
@@ -251,7 +404,8 @@ import torch
                 self.parallel_dims.copy(),
                 self.all_loops.copy(),
                 self.stored_tensor_dims.copy(),
-                self.intermediate_tensors.copy()  # Add intermediate tensors info
+                self.intermediate_tensors.copy(),  # Add intermediate tensors info
+                cross_sloop_memory_tensors.copy()  # Add cross-sloop memory tensors info
             ))
             
             # Collect block parameters for this specific kernel
@@ -280,7 +434,7 @@ import torch
         # Collect all unique block parameters needed
         all_block_params = set()
         
-        for _, _, tensors_used, _, all_loops, _, _ in self.generated_kernels:
+        for _, _, tensors_used, _, all_loops, _, _, _ in self.generated_kernels:
             all_tensors.update(tensors_used)
             # Collect block parameters from loops
             for loop_var, _, _, tile_size in all_loops:
@@ -294,6 +448,11 @@ import torch
         # 2. Input tensors that appear in load operations (not intermediate)
         # This excludes local intermediate tensors that are allocated inside kernels
         forward_params = []
+        
+        # Debug print to understand tensor classification
+        # print(f"DEBUG: all_tensors = {sorted(all_tensors)}")
+        # print(f"DEBUG: all_local_intermediate_tensors = {sorted(all_local_intermediate_tensors)}")
+        
         for tensor_name in sorted(all_tensors):
             # Exclude local intermediate tensors (allocated with tl.zeros inside kernels)
             if tensor_name not in all_local_intermediate_tensors:
@@ -321,7 +480,7 @@ import torch
         code += '    """\n'
         
         # Call each kernel
-        for kernel_name, _, tensors_used, parallel_dims, all_loops, stored_tensor_dims, intermediate_tensors in self.generated_kernels:
+        for kernel_name, _, tensors_used, parallel_dims, all_loops, stored_tensor_dims, intermediate_tensors, cross_sloop_memory_tensors in self.generated_kernels:
             # Calculate grid size for this kernel
             if parallel_dims:
                 grid_parts = []
@@ -403,7 +562,15 @@ import torch
             kernel_params = []
             
             # First, add parameters for non-intermediate tensors (in sorted order)
-            non_intermediate_tensors = sorted([t for t in tensors_used if t not in intermediate_tensors or t in self.cross_kernel_tensors])
+            # Include tensors that are:
+            # 1. Not intermediate tensors, OR
+            # 2. Cross-kernel tensors that are actually used in this kernel, OR
+            # 3. Cross-sloop memory tensors (need memory allocation)
+            non_intermediate_tensors = sorted([t for t in tensors_used 
+                                             if t not in intermediate_tensors 
+                                             or (t in self.cross_kernel_tensors and t in tensors_used)
+                                             or t in cross_sloop_memory_tensors])
+            
             for tensor in non_intermediate_tensors:
                 # Pointer
                 kernel_params.append(f"        {tensor}")
@@ -528,6 +695,9 @@ import torch
         # Save cross_sloop_memory_tensors before reset
         saved_cross_sloop_memory_tensors = getattr(self, 'cross_sloop_memory_tensors', set()).copy()
         
+        # Track accumulators that need special handling
+        self.kernel_accumulators = set()
+        
         # Reset state for this kernel
         self.parallel_dims = []
         self.all_loops = []
@@ -544,7 +714,17 @@ import torch
         self.load_cache = {}  # Reset load cache for each kernel
         self.intermediate_tensor_indices = {}  # Reset intermediate tensor indices
         self.sloop_temp_vars = {}  # Clear sloop temp vars for new kernel
+        self.generated_masks = {}  # Reset mask cache for each kernel
+        self.mask_scope_level = {}  # Reset mask scope tracking for each kernel
+        self.generated_indices = {}  # Reset indices cache for each kernel
+        self.indices_scope_level = {}  # Reset indices scope tracking for each kernel
         self.current_sloop_info = None  # Reset sloop context
+        self.kernel_accumulators = set()  # Reset kernel accumulators for each kernel
+        self.output_tensors = set()  # Reset output tensors for each kernel
+        self.loop_instance_counter = 0  # Reset loop instance counter
+        self.current_loop_instance = None  # Reset current loop instance
+        self.mask_loop_instance = {}  # Reset mask loop instance tracking
+        self.indices_loop_instance = {}  # Reset indices loop instance tracking
         
         # First pass: collect all tensors used in the AST
         self._collect_tensors(ast)
@@ -572,10 +752,35 @@ import torch
         # Generate intermediate tensor allocations
         kernel_code += self._generate_intermediate_allocations(ast)
         
+        # Identify accumulators among cross-kernel tensors
+        all_accumulators = self._identify_accumulators(ast)
+        for tensor in all_accumulators:
+            if (tensor in self.cross_kernel_tensors or 
+                tensor in self.cross_sloop_memory_tensors or
+                (tensor in self.output_tensors and tensor in self.intermediate_tensors)):
+                self.kernel_accumulators.add(tensor)
+        
+        # Initialize kernel accumulators
+        kernel_code += self._generate_kernel_accumulator_init()
+        
         kernel_code += self._generate_node(ast)
+        
+        # Store kernel accumulators at the end
+        kernel_code += self._generate_kernel_accumulator_stores()
         self.indent_level = 0  # Reset indent level
         
         return kernel_code
+    
+    def _contains_only_stores(self, node: ASTNode) -> bool:
+        """Check if a node (typically SEQ) contains only STORE operations"""
+        if node.node_type == NodeType.STORE:
+            return True
+        elif node.node_type == NodeType.SEQ:
+            return all(self._contains_only_stores(child) for child in node.children)
+        elif node.node_type == NodeType.DUMMY:
+            return True
+        else:
+            return False
     
     def _collect_tensors(self, node: ASTNode):
         """Collect all tensor names used in the AST"""
@@ -585,6 +790,10 @@ import torch
                 if child.node_type == NodeType.VAR:
                     tensor_name = child.value
                     self.tensors_used.add(tensor_name)
+                    # Track output tensors specifically
+                    if node.node_type == NodeType.OUTPUT:
+                        self.output_tensors.add(tensor_name)
+
 
         for child in node.children:
             if isinstance(child, ASTNode):
@@ -688,16 +897,22 @@ import torch
         if node.node_type == NodeType.STORE:
             tensor_node = node.children[0]
             if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                tensor_name = tensor_node.children[0].value
-                writes.add(tensor_name)
+                # Handle multiple tensor names (comma-separated)
+                for child in tensor_node.children:
+                    if child.node_type == NodeType.VAR:
+                        tensor_name = child.value
+                        writes.add(tensor_name)
             # Also check for reads in the value expression
             if len(node.children) > 1:
                 self._collect_tensor_usage(node.children[1], writes, reads)
         elif node.node_type == NodeType.LOAD:
             tensor_node = node.children[0]
             if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                tensor_name = tensor_node.children[0].value
-                reads.add(tensor_name)
+                # Handle multiple tensor names (comma-separated)
+                for child in tensor_node.children:
+                    if child.node_type == NodeType.VAR:
+                        tensor_name = child.value
+                        reads.add(tensor_name)
         else:
             # Recursively check children
             for child in node.children:
@@ -716,17 +931,20 @@ import torch
             # Found a store inside a ploop
             tensor_node = node.children[0]
             if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
-                tensor_name = tensor_node.children[0].value
-                # Analyze the index to find which dimension uses the ploop variable
-                if len(node.children) >= 3:
-                    index_node = node.children[2]
-                    dims_using_ploop = self._find_dims_using_loop_var(index_node, current_ploop_var)
-                    
-                    if current_ploop_var not in self.stored_tensor_dims:
-                        self.stored_tensor_dims[current_ploop_var] = []
-                    
-                    for dim in dims_using_ploop:
-                        self.stored_tensor_dims[current_ploop_var].append((tensor_name, dim))
+                # Handle multiple tensor names (comma-separated)
+                for child in tensor_node.children:
+                    if child.node_type == NodeType.VAR:
+                        tensor_name = child.value
+                        # Analyze the index to find which dimension uses the ploop variable
+                        if len(node.children) >= 3:
+                            index_node = node.children[2]
+                            dims_using_ploop = self._find_dims_using_loop_var(index_node, current_ploop_var)
+                            
+                            if current_ploop_var not in self.stored_tensor_dims:
+                                self.stored_tensor_dims[current_ploop_var] = []
+                            
+                            for dim in dims_using_ploop:
+                                self.stored_tensor_dims[current_ploop_var].append((tensor_name, dim))
         else:
             # Recursively analyze children
             for child in node.children:
@@ -815,6 +1033,137 @@ import torch
         traverse(ast)
         return accumulators
     
+    def _generate_kernel_accumulator_init(self) -> str:
+        """Generate initialization code for kernel accumulators"""
+        if not self.kernel_accumulators:
+            return ""
+        
+        code = ""
+        indent_str = '    ' * self.indent_level
+        code += f"{indent_str}# Initialize kernel accumulators\n"
+        
+        for tensor in sorted(self.kernel_accumulators):
+            # Check if we have the index pattern for this accumulator
+            if tensor in self.intermediate_tensor_indices:
+                index_node = self.intermediate_tensor_indices[tensor]
+                # Analyze the index pattern to determine actual accumulator size
+                actual_shape_dims = []
+                
+                for i, idx_child in enumerate(index_node.children):
+                    if idx_child.node_type == NodeType.FULLTILE:
+                        # Full dimension - use the tensor shape dimension
+                        if tensor in self.tensor_shapes and i < len(self.tensor_shapes[tensor]):
+                            dim = self.tensor_shapes[tensor][i]
+                            if isinstance(dim, str) and dim in self.constants:
+                                actual_shape_dims.append(str(self.constants[dim]))
+                            elif isinstance(dim, str):
+                                actual_shape_dims.append(dim)
+                            else:
+                                actual_shape_dims.append(str(dim))
+                    elif idx_child.node_type == NodeType.TILE:
+                        # Tile dimension - use BLOCK_<var>
+                        tile_var = idx_child.children[0].value
+                        actual_shape_dims.append(f"BLOCK_{tile_var.upper()}")
+                
+                # Generate initialization with the actual dimensions
+                shape_str = ", ".join(actual_shape_dims)
+                # Only add trailing comma for 1D tensors
+                if len(actual_shape_dims) == 1:
+                    code += f"{indent_str}{tensor} = tl.zeros(({shape_str},), dtype=tl.float16)\n"
+                else:
+                    code += f"{indent_str}{tensor} = tl.zeros(({shape_str}), dtype=tl.float16)\n"
+            elif tensor in self.tensor_shapes:
+                # Fallback to tensor shape with power-of-2 padding
+                shape = self.tensor_shapes[tensor]
+                # Convert shape names to actual dimensions and round up to power of 2
+                shape_dims = []
+                padded_shape_dims = []
+                for dim in shape:
+                    if isinstance(dim, str):
+                        if dim in self.constants:
+                            actual_size = self.constants[dim]
+                            shape_dims.append(str(actual_size))
+                            # Round up to next power of 2
+                            padded_size = 1
+                            while padded_size < actual_size:
+                                padded_size *= 2
+                            padded_shape_dims.append(str(padded_size))
+                        else:
+                            shape_dims.append(dim)
+                            # For symbolic dimensions, use the dimension directly
+                            padded_shape_dims.append(dim)
+                    else:
+                        shape_dims.append(str(dim))
+                        # Round up to next power of 2
+                        padded_size = 1
+                        while padded_size < dim:
+                            padded_size *= 2
+                        padded_shape_dims.append(str(padded_size))
+                
+                # Generate initialization with tl.zeros using padded dimensions
+                padded_shape_str = ", ".join(padded_shape_dims)
+                # Only add trailing comma for 1D tensors
+                if len(padded_shape_dims) == 1:
+                    code += f"{indent_str}{tensor} = tl.zeros(({padded_shape_str},), dtype=tl.float16)\n"
+                else:
+                    code += f"{indent_str}{tensor} = tl.zeros(({padded_shape_str}), dtype=tl.float16)\n"
+            else:
+                # Default to scalar if shape not found
+                code += f"{indent_str}{tensor} = tl.zeros((1,), dtype=tl.float16)[0]\n"
+        
+        return code
+    
+    def _generate_kernel_accumulator_stores(self) -> str:
+        """Generate code to store kernel accumulators at the end"""
+        if not self.kernel_accumulators:
+            return ""
+        
+        code = ""
+        indent_str = '    ' * self.indent_level
+        code += f"{indent_str}# Store kernel accumulators\n"
+        
+        for tensor in sorted(self.kernel_accumulators):
+            # Generate store code for the accumulator
+            if tensor in self.intermediate_tensor_indices:
+                # Use the stored index pattern
+                index_node = self.intermediate_tensor_indices[tensor]
+                index_code = self._generate_index(index_node, tensor)
+                
+                # Generate the store with mask for correct size
+                code += f"{indent_str}offset_{self.offset_counter} = {index_code}\n"
+                
+                # Generate mask if needed
+                mask_code, mask_var = self._generate_mask_for_index(index_node, tensor)
+                if mask_var:
+                    if mask_code:
+                        code += mask_code
+                    # Need to slice the accumulator to actual size before storing
+                    if tensor in self.tensor_shapes:
+                        shape = self.tensor_shapes[tensor]
+                        # Generate slicing based on actual dimensions
+                        slice_exprs = []
+                        for i, dim in enumerate(shape):
+                            if isinstance(dim, str):
+                                if dim in self.constants:
+                                    slice_exprs.append(f":tl.arange(0, {self.constants[dim]})")
+                                else:
+                                    slice_exprs.append(f":tl.arange(0, {dim})")
+                            else:
+                                slice_exprs.append(f":tl.arange(0, {dim})")
+                        
+                        # For now, just use mask without slicing
+                        code += f"{indent_str}tl.store({tensor}_ptr + offset_{self.offset_counter}, {tensor}, mask={mask_var})\n"
+                    else:
+                        code += f"{indent_str}tl.store({tensor}_ptr + offset_{self.offset_counter}, {tensor}, mask={mask_var})\n"
+                else:
+                    code += f"{indent_str}tl.store({tensor}_ptr + offset_{self.offset_counter}, {tensor})\n"
+                self.offset_counter += 1
+            else:
+                # Default simple store for scalars
+                code += f"{indent_str}tl.store({tensor}_ptr, {tensor})\n"
+        
+        return code
+    
     def _identify_cross_sloop_tensors(self, ast: ASTNode) -> set:
         """Identify tensors that are used across different sloop scopes"""
         cross_sloop_tensors = set()
@@ -877,10 +1226,10 @@ import torch
         return cross_sloop_tensors
     
     def _identify_cross_sloop_memory_tensors(self, ast: ASTNode) -> set:
-        """Identify cross-sloop tensors that need memory storage due to different index patterns"""
+        """Identify tensors that need memory storage due to different index patterns across any loops"""
         memory_tensors = set()
-        tensor_index_patterns = {}  # tensor_name -> {sloop_id -> index_pattern}
-        sloop_counter = [0]
+        tensor_index_patterns = {}  # tensor_name -> {loop_id -> {patterns}}
+        loop_counter = [0]
         
         def extract_index_pattern(index_node: ASTNode) -> str:
             """Extract a simplified representation of index pattern"""
@@ -896,7 +1245,18 @@ import torch
                     else:
                         pattern_parts.append("tile")
                 elif child.node_type == NodeType.FULLTILE:
-                    pattern_parts.append("fulltile")
+                    # For fulltile, we need to check if it has children with tile info
+                    if child.children:
+                        for sub_child in child.children:
+                            if sub_child.node_type == NodeType.TILE and sub_child.children:
+                                if sub_child.children[0].node_type == NodeType.VAR:
+                                    pattern_parts.append(f"fulltile_tile_{sub_child.children[0].value}")
+                                else:
+                                    pattern_parts.append("fulltile_tile")
+                            else:
+                                pattern_parts.append("fulltile")
+                    else:
+                        pattern_parts.append("fulltile")
                 elif child.node_type == NodeType.ELEM:
                     if child.children and child.children[0].node_type == NodeType.VAR:
                         pattern_parts.append(f"elem_{child.children[0].value}")
@@ -907,14 +1267,14 @@ import torch
             
             return "_".join(pattern_parts)
         
-        def collect_tensor_patterns(node: ASTNode, current_sloop_id: int = -1):
-            """Collect index patterns for tensor accesses"""
-            if node.node_type == NodeType.SLOOP:
-                sloop_counter[0] += 1
-                new_sloop_id = sloop_counter[0]
+        def collect_tensor_patterns(node: ASTNode, current_loop_id: int = -1):
+            """Collect index patterns for tensor accesses in all loop types"""
+            if node.node_type in [NodeType.SLOOP, NodeType.PLOOP]:
+                loop_counter[0] += 1
+                new_loop_id = loop_counter[0]
                 for child in node.children:
                     if isinstance(child, ASTNode):
-                        collect_tensor_patterns(child, new_sloop_id)
+                        collect_tensor_patterns(child, new_loop_id)
             elif node.node_type in [NodeType.STORE, NodeType.LOAD]:
                 tensor_node = node.children[0] if node.children else None
                 if tensor_node and tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
@@ -930,50 +1290,51 @@ import torch
                             synthetic_index = ASTNode(NodeType.INDEX, [index_node])
                             index_node = synthetic_index
                     
-                    if index_node and current_sloop_id != -1:
+                    if index_node:
                         pattern = extract_index_pattern(index_node)
                         for child in tensor_node.children:
                             if child.node_type == NodeType.VAR:
                                 tensor_name = child.value
                                 if tensor_name not in tensor_index_patterns:
                                     tensor_index_patterns[tensor_name] = {}
-                                if current_sloop_id not in tensor_index_patterns[tensor_name]:
-                                    tensor_index_patterns[tensor_name][current_sloop_id] = set()
-                                tensor_index_patterns[tensor_name][current_sloop_id].add(pattern)
+                                # Use -1 for global scope (outside any loop)
+                                loop_id = current_loop_id if current_loop_id != -1 else -1
+                                if loop_id not in tensor_index_patterns[tensor_name]:
+                                    tensor_index_patterns[tensor_name][loop_id] = set()
+                                tensor_index_patterns[tensor_name][loop_id].add(pattern)
                 
                 # Continue traversing
                 for child in node.children:
                     if isinstance(child, ASTNode):
-                        collect_tensor_patterns(child, current_sloop_id)
+                        collect_tensor_patterns(child, current_loop_id)
             else:
                 for child in node.children:
                     if isinstance(child, ASTNode):
-                        collect_tensor_patterns(child, current_sloop_id)
+                        collect_tensor_patterns(child, current_loop_id)
         
         collect_tensor_patterns(ast)
         
-        # Find tensors with different patterns across sloops
-        for tensor_name, sloop_patterns in tensor_index_patterns.items():
-            if len(sloop_patterns) > 1:
-                # Collect all unique patterns across different sloops
-                all_patterns = set()
-                for patterns in sloop_patterns.values():
-                    all_patterns.update(patterns)
+        # Find tensors with different patterns anywhere
+        for tensor_name, loop_patterns in tensor_index_patterns.items():
+            # Collect all unique patterns across all contexts
+            all_patterns = set()
+            for patterns in loop_patterns.values():
+                all_patterns.update(patterns)
+            
+            # If there are different patterns anywhere, this tensor needs memory storage
+            if len(all_patterns) > 1:
+                memory_tensors.add(tensor_name)
                 
-                # If there are different patterns, this tensor needs memory storage
-                if len(all_patterns) > 1:
+                # Also check if patterns involve different tile variables
+                tile_vars = set()
+                for pattern in all_patterns:
+                    if "tile_" in pattern:
+                        import re
+                        matches = re.findall(r'tile_(\w+)', pattern)
+                        tile_vars.update(matches)
+                if len(tile_vars) > 1:
+                    # Different tile variables used - definitely needs memory
                     memory_tensors.add(tensor_name)
-                    # Check if patterns involve different tile variables
-                    tile_vars = set()
-                    for pattern in all_patterns:
-                        if "tile_" in pattern:
-                            # Extract tile variable names
-                            import re
-                            matches = re.findall(r'tile_(\w+)', pattern)
-                            tile_vars.update(matches)
-                    if len(tile_vars) > 1:
-                        # Different tile variables used - definitely needs memory
-                        memory_tensors.add(tensor_name)
         
         return memory_tensors
 
@@ -1185,10 +1546,7 @@ import torch
         # Only allocate intermediate tensors that are NOT cross-kernel tensors and NOT cross-sloop memory tensors
         local_intermediates = self.intermediate_tensors - self.cross_kernel_tensors - self.cross_sloop_memory_tensors
         
-        # Track temporary variables that will be created for sloop non-accumulation stores
-        sloop_temp_vars_shapes = {}
-        
-        if not local_intermediates and not sloop_temp_vars_shapes:
+        if not local_intermediates:
             return ""
         
         # Identify which tensors are accumulators
@@ -1205,10 +1563,6 @@ import torch
             sloop_intermediate_tensors = self._identify_sloop_intermediate_tensors(ast)
             cross_sloop_memory_tensors = self._identify_cross_sloop_memory_tensors(ast)
             
-            # Identify tensors that will need temp vars in sloop
-            sloop_tensors_no_loop_var = self._identify_sloop_intermediate_tensors_without_loop_var(ast)
-            temp_counter_saved = self.temp_counter
-            
             # Remove accumulators from cross-sloop memory tensors
             # Accumulators should stay as register-based intermediate tensors
             cross_sloop_memory_tensors -= accumulators
@@ -1220,31 +1574,6 @@ import torch
             self.tensors_used.update(cross_sloop_memory_tensors)
             # Store for later use in generate_store
             self.cross_sloop_memory_tensors = cross_sloop_memory_tensors
-            
-            # Check each sloop individually for accumulation patterns
-            for tensor_name in sloop_tensors_no_loop_var:
-                
-                if tensor_name in self.intermediate_tensors:
-                    # For each sloop where this tensor appears without loop var
-                    for sloop_node, loop_var in sloop_tensors_no_loop_var[tensor_name]:
-                        # Check if in THIS specific sloop, the tensor is used in a non-accumulation pattern
-                        is_accumulation_in_this_sloop = self._is_accumulation_in_sloop(sloop_node, tensor_name)
-                        
-                        if not is_accumulation_in_this_sloop:
-                            # Generate the same temp var name that will be used later
-                            # Use a deterministic naming scheme based on tensor name
-                            temp_var_name = f"{tensor_name}_tmp"
-                            
-                            # Get the actual allocated shape for this tensor
-                            allocated_shape = self._get_allocated_tensor_shape(tensor_name)
-                            sloop_temp_vars_shapes[temp_var_name] = allocated_shape
-                            
-                            # Also store mapping for later use
-                            if not hasattr(self, 'sloop_tensor_temp_mapping'):
-                                self.sloop_tensor_temp_mapping = {}
-                            self.sloop_tensor_temp_mapping[tensor_name] = temp_var_name
-                            # Only create one temp var per tensor, even if used in multiple sloops
-                            break
         
         code = "    # Allocate intermediate tensors\n"
         
@@ -1335,23 +1664,6 @@ import torch
             #         code += f"    {tensor_name} = tl.zeros(({tensor_name}_dim0, {tensor_name}_dim1), dtype=tl.float32)\n"
             #     else:
             #         code += f"    # {tensor_name} will be assigned without initialization\n"
-        
-        # Also allocate temporary variables for sloop non-accumulation stores
-        for temp_var_name in sorted(sloop_temp_vars_shapes):
-            shape = sloop_temp_vars_shapes[temp_var_name]
-            # Build shape string using constants or literal values
-            shape_params = []
-            for dim in shape:
-                if isinstance(dim, str):
-                    shape_params.append(dim)
-                else:
-                    shape_params.append(str(dim))
-            # Ensure single-element tuples have trailing comma
-            if len(shape_params) == 1:
-                shape_str = f"({shape_params[0]},)"
-            else:
-                shape_str = f"({', '.join(shape_params)})"
-            code += f"    {temp_var_name} = tl.zeros({shape_str}, dtype=tl.float16)\n"
         
         code += "\n"
         return code
@@ -1603,6 +1915,11 @@ def {kernel_name}(
         code = f"{indent}# Sequential loop {loop_var} from {start} to {end_param} with tile size {block_param}\n"
         code += f"{indent}for {loop_var} in range({start}, {end_param}, {block_param}):\n"
         
+        # Increment loop instance counter for this new loop
+        self.loop_instance_counter += 1
+        saved_loop_instance = self.current_loop_instance
+        self.current_loop_instance = self.loop_instance_counter
+        
         # Clear load cache for loop body since loop variable changes
         # We need to reload tensors that depend on the loop variable
         saved_load_cache = self.load_cache.copy()
@@ -1630,6 +1947,9 @@ def {kernel_name}(
         # Restore previous sloop context
         self.current_sloop_info = saved_sloop_info
         
+        # Restore previous loop instance
+        self.current_loop_instance = saved_loop_instance
+        
         return code
     
     def _generate_seq(self, node: ASTNode) -> str:
@@ -1655,9 +1975,11 @@ def {kernel_name}(
         
         tensor_name = tensor_node.children[0].value
         
-        # Check if we have a temporary variable for this tensor (from sloop non-accumulation store)
-        if tensor_name in self.sloop_temp_vars:
-            node.temp_var = self.sloop_temp_vars[tensor_name]
+        # Skip checking for temporary variables - we don't create them anymore
+        
+        # Check if this is a kernel accumulator - if so, just return the accumulator variable
+        if tensor_name in self.kernel_accumulators:
+            node.temp_var = tensor_name
             return ""
         
         # Check if this is a local intermediate tensor (not cross-kernel and not cross-sloop memory)
@@ -1670,6 +1992,11 @@ def {kernel_name}(
             return ""
         
         # For input/output tensors and cross-kernel tensors, use normal load operation
+        # Handle case where index_node is directly FULLTILE (not wrapped in INDEX)
+        if index_node.node_type == NodeType.FULLTILE:
+            # Wrap the FULLTILE in an INDEX node for proper handling
+            index_node = ASTNode(NodeType.INDEX, [index_node])
+        
         offset_expr = self._generate_index(index_node, tensor_name)
         
         # Create a cache key from tensor name and offset expression
@@ -1699,7 +2026,17 @@ def {kernel_name}(
         # Use proper indentation based on current context
         indent_str = '    ' * self.indent_level
         code = f"{indent_str}{offset_var} = {offset_expr}\n"
-        code += f"{indent_str}{var_name} = tl.load({tensor_name}_ptr + {offset_var})"
+        
+        # Generate mask if needed
+        mask_code, mask_var = self._generate_mask_for_index(index_node, tensor_name)
+        if mask_var:  # Check if mask_var exists, not just mask_code
+            # print(f"DEBUG: Adding mask to load for {tensor_name}, mask_var={mask_var}")
+            if mask_code:
+                code += mask_code
+            code += f"{indent_str}{var_name} = tl.load({tensor_name}_ptr + {offset_var}, mask={mask_var}, other=0.0)"
+        else:
+            # print(f"DEBUG: No mask needed for load of {tensor_name}")
+            code += f"{indent_str}{var_name} = tl.load({tensor_name}_ptr + {offset_var})"
         
         # No need for expand_dims anymore - proper offset calculation handles all dimensions
         # The loaded tensor will have the correct shape based on the offset dimensions
@@ -1756,6 +2093,23 @@ def {kernel_name}(
         
         tensor_name = tensor_node.children[0].value
         tensor_type = tensor_node.node_type
+        
+        # Skip store operation if this is a kernel accumulator
+        # These will be handled by _generate_kernel_accumulator_stores() at the end
+        if tensor_name in self.kernel_accumulators:
+            # Still need to generate the value expression for accumulation
+            # For accumulation patterns, we need to update the accumulator in place
+            code = ""
+            if self._contains_loads(val_node) or self._contains_reduce_sum(val_node):
+                code = self._generate_loads_separately(val_node)
+                value_expr = self._generate_node_without_loads(val_node)
+            else:
+                value_expr = self._generate_node(val_node)
+            
+            indent_str = '    ' * self.indent_level
+            # Generate accumulation update (not a store operation)
+            code += f"{indent_str}{tensor_name} = {value_expr}\n"
+            return code.rstrip('\n')
         
         # First generate any load operations in the value expression
         code = ""
@@ -1936,10 +2290,14 @@ def {kernel_name}(
         indent_str = '    ' * self.indent_level
         
         # Check if this is an output tensor, input tensor, cross-kernel intermediate tensor, or cross-sloop memory tensor
+        # Also check if this tensor is used with different index patterns in sloops
+        is_cross_sloop_memory = (hasattr(self, 'cross_sloop_memory_tensors') and 
+                                tensor_name in self.cross_sloop_memory_tensors)
+        
         if (tensor_type == NodeType.OUTPUT or 
             tensor_type == NodeType.INPUT or 
             (tensor_type == NodeType.TENSOR and tensor_name in self.cross_kernel_tensors) or
-            (tensor_type == NodeType.TENSOR and hasattr(self, 'cross_sloop_memory_tensors') and tensor_name in self.cross_sloop_memory_tensors)):
+            (tensor_type == NodeType.TENSOR and is_cross_sloop_memory)):
             # For output tensors, input tensors, and cross-kernel intermediates, use tl.store
             offset_expr = self._generate_index(index_node, tensor_name)
             
@@ -1949,7 +2307,17 @@ def {kernel_name}(
             
             # Generate code with separate offset variable
             code += f"{indent_str}{offset_var} = {offset_expr}\n"
-            code += f"{indent_str}tl.store({tensor_name}_ptr + {offset_var}, {value_expr})"
+            
+            # Generate mask if needed for store
+            mask_code, mask_var = self._generate_mask_for_index(index_node, tensor_name)
+            if mask_var:  # Check if mask_var exists, not just mask_code
+                # print(f"DEBUG: Adding mask to store for {tensor_name}, mask_var={mask_var}")
+                if mask_code:
+                    code += mask_code
+                code += f"{indent_str}tl.store({tensor_name}_ptr + {offset_var}, {value_expr}, mask={mask_var})"
+            else:
+                # print(f"DEBUG: No mask needed for store of {tensor_name}")
+                code += f"{indent_str}tl.store({tensor_name}_ptr + {offset_var}, {value_expr})"
         else:
             # For intermediate tensors (pre-allocated with tl.zeros), use direct assignment
             # Check if index has any tiles or if it's a simple element access
@@ -1957,26 +2325,9 @@ def {kernel_name}(
                           for child in index_node.children)
             
             # Check if we're in a sloop and need to create a temporary variable
-            should_create_temp = False
-            if (self.current_sloop_info and 
-                tensor_name in self.intermediate_tensors and
-                not self._is_accumulation_pattern(val_node, tensor_name)):
-                # Check if the expression uses the loop variable
-                loop_var, sloop_node = self.current_sloop_info
-                if not self._expression_uses_var(val_node, loop_var):
-                    should_create_temp = True
-            
-            if should_create_temp:
-                # Create a temporary variable for this non-accumulation store in sloop
-                # Use the pre-determined temp var name
-                if hasattr(self, 'sloop_tensor_temp_mapping') and tensor_name in self.sloop_tensor_temp_mapping:
-                    temp_var = self.sloop_tensor_temp_mapping[tensor_name]
-                else:
-                    # Fallback to deterministic naming
-                    temp_var = f"{tensor_name}_tmp"
-                self.sloop_temp_vars[tensor_name] = temp_var
-                code += f"{indent_str}{temp_var} = {value_expr}"
-            elif has_tiles:
+            # Skip temporary variable creation for intermediate tensors in sloop
+            # They should be stored directly to memory if they are cross-sloop tensors
+            if has_tiles:
                 # For tiled access, we need to handle accumulation patterns
                 # Check if this is an accumulation pattern (common in matrix multiply)
                 if val_node.node_type == NodeType.ADD and len(val_node.children) > 0:
