@@ -39,6 +39,37 @@ class TritonCodeGen:
         self.mask_loop_instance = {}  # Track which loop instance each mask belongs to
         self.indices_loop_instance = {}  # Track which loop instance each indices var belongs to
         
+    def _next_power_of_2(self, n):
+        """Round up to the next power of 2"""
+        if n <= 0:
+            return 1
+        # Check if already power of 2
+        if (n & (n - 1)) == 0:
+            return n
+        # Find the next power of 2
+        power = 1
+        while power < n:
+            power <<= 1
+        return power
+        
+    def _get_padded_block_size(self, size_expr):
+        """Get padded block size and whether padding was applied"""
+        # Try to evaluate if it's a constant
+        try:
+            if isinstance(size_expr, str) and size_expr in self.constants:
+                size_val = self.constants[size_expr]
+            elif isinstance(size_expr, (int, float)):
+                size_val = int(size_expr)
+            else:
+                # If it's a dynamic expression, return as is
+                return size_expr, False
+                
+            padded_size = self._next_power_of_2(size_val)
+            return padded_size, padded_size != size_val
+        except:
+            # If evaluation fails, return original
+            return size_expr, False
+        
     def _generate_mask_for_index(self, index_node: ASTNode, tensor_name: str) -> tuple:
         """Generate mask code for tensor access if needed
         Returns: (mask_code, mask_var_name or None)
@@ -67,6 +98,29 @@ class TritonCodeGen:
                             # Symbolic dimension - always need mask for safety
                             block_param = f"BLOCK_{loop_var.upper()}"
                             tiles_needing_mask.append((loop_var, i, block_param, dim_size))
+            elif child.node_type == NodeType.FULLTILE:
+                # For fulltile, check if the full dimension needs masking
+                if tensor_name in self.tensor_shapes and i < len(self.tensor_shapes[tensor_name]):
+                    dim_size = self.tensor_shapes[tensor_name][i]
+                    # Fulltile uses the entire dimension, but we still need to check bounds
+                    # Create a pseudo loop_var for the fulltile dimension
+                    pseudo_var = f"fulltile_{i}"
+                    # Get the actual range size used in fulltile
+                    if isinstance(dim_size, (int, float)):
+                        # For fulltile with numeric size, we need mask if the size is not aligned
+                        padded_size, needs_padding = self._get_padded_block_size(dim_size)
+                        if needs_padding or dim_size != padded_size:
+                            tiles_needing_mask.append((pseudo_var, i, str(padded_size), dim_size))
+                    elif isinstance(dim_size, str):
+                        # For symbolic dimensions, always need mask for safety
+                        if dim_size in self.constants:
+                            actual_size = self.constants[dim_size]
+                            padded_size, needs_padding = self._get_padded_block_size(actual_size)
+                            if needs_padding or actual_size != padded_size:
+                                tiles_needing_mask.append((pseudo_var, i, str(padded_size), dim_size))
+                        else:
+                            # Unknown symbolic size, need mask
+                            tiles_needing_mask.append((pseudo_var, i, dim_size, dim_size))
         
         if not tiles_needing_mask:
             return "", None
@@ -102,31 +156,71 @@ class TritonCodeGen:
         self.mask_loop_instance[mask_var] = self.current_loop_instance
         
         for loop_var, dim_idx, block_param, dim_size in tiles_needing_mask:
-            indices_var = f"{loop_var}_indices"
-            
-            # Check if indices were already generated and are still in scope
-            need_generate_indices = True
-            if loop_var in self.generated_indices:
-                existing_indices_var = self.generated_indices[loop_var]
-                existing_scope = self.indices_scope_level.get(existing_indices_var, 0)
-                existing_loop_instance = self.indices_loop_instance.get(existing_indices_var, None)
+            # Handle fulltile differently from regular tiles
+            if loop_var.startswith("fulltile_"):
+                # For fulltile, generate indices directly using tl.arange
+                indices_var = f"{loop_var}_indices"
                 
-                # If the existing indices are at the current scope level or higher (lower number),
-                # AND from the same loop instance, reuse them
-                if existing_scope <= self.indent_level and existing_loop_instance == self.current_loop_instance:
-                    indices_var = existing_indices_var
-                    need_generate_indices = False
-            
-            # Generate indices if needed
-            if need_generate_indices:
-                mask_code += f"{indent_str}{indices_var} = {loop_var} + tl.arange(0, {block_param})\n"
-                self.generated_indices[loop_var] = indices_var
-                self.indices_scope_level[indices_var] = self.indent_level
-                self.indices_loop_instance[indices_var] = self.current_loop_instance
-            
-            # Add mask condition
-            # dim_size is already the shape value from tensor_shapes
-            mask_conditions.append(f"{indices_var} < {dim_size}")
+                if indices_var not in self.generated_indices:
+                    # Generate indices for fulltile
+                    if isinstance(block_param, str) and block_param.isdigit():
+                        # Numeric block param (padded size)
+                        mask_code += f"{indent_str}{indices_var} = tl.arange(0, {block_param})\n"
+                    else:
+                        # Symbolic block param
+                        mask_code += f"{indent_str}{indices_var} = tl.arange(0, {block_param})\n"
+                    
+                    self.generated_indices[indices_var] = indices_var
+                    self.indices_scope_level[indices_var] = self.indent_level
+                    self.indices_loop_instance[indices_var] = self.current_loop_instance
+                
+                # Add mask condition for fulltile
+                mask_conditions.append(f"{indices_var} < {dim_size}")
+            else:
+                # Regular tile handling
+                indices_var = f"{loop_var}_indices"
+                
+                # Check if indices were already generated and are still in scope
+                need_generate_indices = True
+                if loop_var in self.generated_indices:
+                    existing_indices_var = self.generated_indices[loop_var]
+                    existing_scope = self.indices_scope_level.get(existing_indices_var, 0)
+                    existing_loop_instance = self.indices_loop_instance.get(existing_indices_var, None)
+                    
+                    # If the existing indices are at the current scope level or higher (lower number),
+                    # AND from the same loop instance, reuse them
+                    if existing_scope <= self.indent_level and existing_loop_instance == self.current_loop_instance:
+                        indices_var = existing_indices_var
+                        need_generate_indices = False
+                
+                # Generate indices if needed
+                if need_generate_indices:
+                    # Get padded block size and check if padding is needed
+                    padded_block, needs_padding = self._get_padded_block_size(block_param)
+                    if needs_padding:
+                        # Use padded size for tl.arange
+                        mask_code += f"{indent_str}{indices_var} = {loop_var} + tl.arange(0, {padded_block})\n"
+                    else:
+                        # Use original size
+                        mask_code += f"{indent_str}{indices_var} = {loop_var} + tl.arange(0, {block_param})\n"
+                    self.generated_indices[loop_var] = indices_var
+                    self.indices_scope_level[indices_var] = self.indent_level
+                    self.indices_loop_instance[indices_var] = self.current_loop_instance
+                
+                # Add mask condition
+                # dim_size is already the shape value from tensor_shapes
+                # If we used padding, we need to ensure mask conditions use original size
+                if need_generate_indices:
+                    # Check if we used padding for this block
+                    padded_block, needs_padding = self._get_padded_block_size(block_param)
+                    if needs_padding:
+                        # Add both bounds check and original size check
+                        mask_conditions.append(f"({indices_var} < {dim_size}) & ({indices_var} >= {loop_var})")
+                    else:
+                        mask_conditions.append(f"{indices_var} < {dim_size}")
+                else:
+                    # Reusing existing indices, still need size check
+                    mask_conditions.append(f"{indices_var} < {dim_size}")
         
         # Combine conditions
         if len(mask_conditions) == 1:
@@ -1145,11 +1239,17 @@ import torch
                         for i, dim in enumerate(shape):
                             if isinstance(dim, str):
                                 if dim in self.constants:
-                                    slice_exprs.append(f":tl.arange(0, {self.constants[dim]})")
+                                    # Use padded size for constants from tensor shapes
+                                    padded_dim, needs_padding = self._get_padded_block_size(self.constants[dim])
+                                    slice_exprs.append(f":tl.arange(0, {padded_dim})")
                                 else:
-                                    slice_exprs.append(f":tl.arange(0, {dim})")
+                                    # Use padded size for dimension variables
+                                    padded_dim, needs_padding = self._get_padded_block_size(dim)
+                                    slice_exprs.append(f":tl.arange(0, {padded_dim})")
                             else:
-                                slice_exprs.append(f":tl.arange(0, {dim})")
+                                # Use padded size for numeric dimensions
+                                padded_dim, needs_padding = self._get_padded_block_size(dim)
+                                slice_exprs.append(f":tl.arange(0, {padded_dim})")
                         
                         # For now, just use mask without slicing
                         code += f"{indent_str}tl.store({tensor}_ptr + offset_{self.offset_counter}, {tensor}, mask={mask_var})\n"
@@ -2412,7 +2512,9 @@ def {kernel_name}(
                 else:
                     # Fallback to parameter name
                     fulltile_dim = f"{tensor_name}_dim{i}"
-                offsets.append(f"tl.arange(0, {fulltile_dim})")
+                # Use padded size for fulltile dimensions
+                padded_dim, needs_padding = self._get_padded_block_size(fulltile_dim)
+                offsets.append(f"tl.arange(0, {padded_dim})")
             elif child.node_type == NodeType.ELEM:
                 # For elem indexing, use the loop variable directly without creating a range
                 # (elem n) means use n as a scalar index
@@ -2448,7 +2550,9 @@ def {kernel_name}(
                 if len(child.children) >= 2:
                     start = self._generate_node(child.children[0])
                     size = self._generate_node(child.children[1])
-                    offsets.append(f"{start} + tl.arange(0, {size})")
+                    # Use padded size for range dimensions
+                    padded_size, needs_padding = self._get_padded_block_size(size)
+                    offsets.append(f"{start} + tl.arange(0, {padded_size})")
         
         # Generate multi-dimensional indexing
         if len(offsets) == 1:
