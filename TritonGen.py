@@ -161,7 +161,19 @@ class TritonCodeGen:
                 # For fulltile, generate indices directly using tl.arange
                 indices_var = f"{loop_var}_indices"
                 
-                if indices_var not in self.generated_indices:
+                # Check if indices were already generated and are still in scope
+                need_generate_indices = True
+                if indices_var in self.generated_indices:
+                    existing_scope = self.indices_scope_level.get(indices_var, 0)
+                    existing_loop_instance = self.indices_loop_instance.get(indices_var, None)
+                    
+                    # For fulltile indices, we need to check if they're accessible from current scope
+                    # If we're at a higher indent level (deeper scope) than where it was defined,
+                    # and it's from a different loop instance, we need to regenerate
+                    if existing_scope <= self.indent_level and (existing_loop_instance == self.current_loop_instance or existing_loop_instance is None):
+                        need_generate_indices = False
+                
+                if need_generate_indices:
                     # Generate indices for fulltile
                     if isinstance(block_param, str) and block_param.isdigit():
                         # Numeric block param (padded size)
