@@ -814,8 +814,8 @@ import torch
         self.loop_var_to_tensor_dim = {}
         self.loop_vars = {}
         
-        # Restore cross_sloop_memory_tensors
-        self.cross_sloop_memory_tensors = saved_cross_sloop_memory_tensors
+        # Don't restore cross_sloop_memory_tensors - we'll compute it fresh for this kernel
+        # self.cross_sloop_memory_tensors = saved_cross_sloop_memory_tensors
         self.stored_tensor_dims = {}
         self.load_cache = {}  # Reset load cache for each kernel
         self.intermediate_tensor_indices = {}  # Reset intermediate tensor indices
@@ -846,6 +846,20 @@ import torch
         
         # Fifth pass: analyze which tensors are stored in parallel loops
         self._analyze_parallel_store_dims(ast)
+        
+        # Identify cross-sloop memory tensors for this kernel
+        cross_sloop_memory_tensors = self._identify_cross_sloop_memory_tensors(ast)
+        
+        # Identify accumulators
+        accumulators = self._identify_accumulators(ast)
+        
+        # Remove accumulators from cross-sloop memory tensors
+        cross_sloop_memory_tensors -= accumulators
+        
+        # Update intermediate tensors and tensors_used
+        self.intermediate_tensors -= cross_sloop_memory_tensors
+        self.tensors_used.update(cross_sloop_memory_tensors)
+        self.cross_sloop_memory_tensors = cross_sloop_memory_tensors
 
         # Generate kernel function
         kernel_code = self._generate_kernel_header(kernel_name)
@@ -1087,6 +1101,124 @@ import torch
                     return True
         
         return False
+    
+    def _find_nested_sloop_accumulators(self, ast: ASTNode) -> set:
+        """Find accumulators that are used in nested sloops within this AST"""
+        accumulators = set()
+        
+        def find_in_sloop(node: ASTNode, in_nested: bool = False):
+            if node.node_type == NodeType.SLOOP:
+                # We're in a nested sloop
+                find_in_sloop(node.children[4], in_nested=True)  # body
+            elif node.node_type == NodeType.STORE and in_nested:
+                tensor_node = node.children[0]
+                val_node = node.children[1]
+                
+                if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
+                    for child in tensor_node.children:
+                        if child.node_type == NodeType.VAR:
+                            tensor_name = child.value
+                            # Check if this is an accumulation in a nested sloop
+                            if self._expression_contains_tensor(val_node, tensor_name):
+                                if self._is_accumulation_pattern(val_node, tensor_name):
+                                    # Check if this tensor is an intermediate tensor
+                                    if tensor_name in self.intermediate_tensors:
+                                        accumulators.add(tensor_name)
+            else:
+                # Continue traversing
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        find_in_sloop(child, in_nested)
+        
+        find_in_sloop(ast)
+        return accumulators
+    
+    def _generate_nested_accumulator_init(self, accumulators: set) -> str:
+        """Generate initialization code for nested accumulators"""
+        if not accumulators:
+            return ""
+        
+        code = ""
+        indent = '    ' * self.indent_level
+        
+        for tensor_name in sorted(accumulators):
+            if tensor_name in self.tensor_shapes:
+                shape = self.tensor_shapes[tensor_name]
+                # Build shape string using the same logic as _generate_intermediate_allocations
+                shape_params = []
+                
+                # Check if we have index pattern information for this tensor
+                if hasattr(self, 'intermediate_tensor_indices') and tensor_name in self.intermediate_tensor_indices:
+                    index_node = self.intermediate_tensor_indices[tensor_name]
+                    # Analyze each dimension of the index using same logic as _generate_intermediate_allocations
+                    for i, child in enumerate(index_node.children):
+                        if child.node_type == NodeType.FULLTILE:
+                            # For fulltile, use the full dimension from tensor_shapes
+                            if i < len(shape):
+                                dim = shape[i]
+                                if isinstance(dim, str):
+                                    shape_params.append(dim)
+                                else:
+                                    shape_params.append(str(dim))
+                            else:
+                                shape_params.append(f"{tensor_name}_dim{i}")
+                        elif child.node_type == NodeType.TILE:
+                            # For tile, use the corresponding BLOCK parameter
+                            if child.children and child.children[0].node_type == NodeType.VAR:
+                                loop_var = child.children[0].value
+                                # Check if this is actually a loop variable in all_loops
+                                is_loop_var = any(lv == loop_var for lv, _, _, _ in self.all_loops)
+                                if is_loop_var:
+                                    block_param = f"BLOCK_{loop_var.upper()}"
+                                    shape_params.append(block_param)
+                                else:
+                                    # Not a loop variable, but still create BLOCK parameter
+                                    block_param = f"BLOCK_{loop_var.upper()}"
+                                    shape_params.append(block_param)
+                            else:
+                                # Fallback to original dimension
+                                if i < len(shape):
+                                    dim = shape[i]
+                                    if isinstance(dim, str):
+                                        shape_params.append(dim)
+                                    else:
+                                        shape_params.append(str(dim))
+                        elif child.node_type == NodeType.ELEM:
+                            # For elem, this dimension is size 1
+                            shape_params.append("1")
+                else:
+                    # No index pattern info, use original logic
+                    for dim in shape:
+                        if isinstance(dim, str):
+                            # It's a symbolic dimension or expression
+                            # For simple variables, use them directly in the code
+                            # For expressions, resolve them to values
+                            if dim in self.constants:
+                                # Simple variable, use it directly
+                                shape_params.append(dim)
+                            elif any(op in dim for op in ['+', '-', '*', '//']):
+                                # Expression, resolve it to a value
+                                resolved = self.resolve_value(dim)
+                                shape_params.append(resolved)
+                            elif dim.startswith('BLOCK_'):
+                                # Block parameter, use as is
+                                shape_params.append(dim)
+                            else:
+                                # Unknown variable, use as is (might cause error)
+                                shape_params.append(dim)
+                        else:
+                            # It's a literal number
+                            shape_params.append(str(dim))
+                
+                # Ensure single-element tuples have trailing comma
+                if len(shape_params) == 1:
+                    shape_str = f"({shape_params[0]},)"
+                else:
+                    shape_str = f"({', '.join(shape_params)})"
+                    
+                code += f"{indent}{tensor_name} = tl.zeros({shape_str}, dtype=tl.float16)\n"
+        
+        return code
     
     def _identify_accumulators(self, ast: ASTNode) -> set:
         """Identify which intermediate tensors are accumulators"""
@@ -1448,6 +1580,16 @@ import torch
                     # Different tile variables used - definitely needs memory
                     memory_tensors.add(tensor_name)
         
+        # Additionally, find cross-sloop tensors that are not accumulators
+        # These also need memory storage even if they have the same index pattern
+        cross_sloop_tensors = self._identify_cross_sloop_tensors(ast)
+        accumulators = self._identify_accumulators(ast)
+        
+        # Add cross-sloop non-accumulator tensors to memory tensors
+        for tensor_name in cross_sloop_tensors:
+            if tensor_name not in accumulators and tensor_name in self.intermediate_tensors:
+                memory_tensors.add(tensor_name)
+        
         return memory_tensors
 
     def _identify_sloop_intermediate_tensors(self, ast: ASTNode) -> set:
@@ -1655,12 +1797,6 @@ import torch
     
     def _generate_intermediate_allocations(self, ast: ASTNode = None) -> str:
         """Generate tl.zeros allocations for intermediate tensors"""
-        # Only allocate intermediate tensors that are NOT cross-kernel tensors and NOT cross-sloop memory tensors
-        local_intermediates = self.intermediate_tensors - self.cross_kernel_tensors - self.cross_sloop_memory_tensors
-        
-        if not local_intermediates:
-            return ""
-        
         # Identify which tensors are accumulators
         accumulators = set()
         # Identify which tensors are used across different sloops
@@ -1684,8 +1820,38 @@ import torch
             self.intermediate_tensors -= cross_sloop_memory_tensors
             # Add them to tensors_used instead
             self.tensors_used.update(cross_sloop_memory_tensors)
-            # Store for later use in generate_store
-            self.cross_sloop_memory_tensors = cross_sloop_memory_tensors
+            # Don't overwrite self.cross_sloop_memory_tensors if it already exists
+            # It should have been set in _generate_single_kernel or _generate_seq_kernels
+            if not hasattr(self, 'cross_sloop_memory_tensors') or not self.cross_sloop_memory_tensors:
+                self.cross_sloop_memory_tensors = cross_sloop_memory_tensors
+        
+        # Only allocate intermediate tensors that are NOT cross-kernel tensors and NOT cross-sloop memory tensors
+        local_intermediates = self.intermediate_tensors - self.cross_kernel_tensors - cross_sloop_memory_tensors
+        
+        if not local_intermediates:
+            return ""
+        
+        # Find accumulators that will be initialized inside sloops
+        nested_sloop_accumulators = set()
+        
+        def find_sloop_accumulators(node: ASTNode):
+            if node.node_type == NodeType.SLOOP:
+                # Find accumulators in this sloop's body
+                sloop_accums = self._find_nested_sloop_accumulators(node.children[4])
+                nested_sloop_accumulators.update(sloop_accums)
+            else:
+                for child in node.children:
+                    if isinstance(child, ASTNode):
+                        find_sloop_accumulators(child)
+        
+        if ast:
+            find_sloop_accumulators(ast)
+        
+        # Exclude nested sloop accumulators from global initialization
+        local_intermediates = local_intermediates - nested_sloop_accumulators
+        
+        if not local_intermediates:
+            return ""
         
         code = "    # Allocate intermediate tensors\n"
         
@@ -2042,6 +2208,14 @@ def {kernel_name}(
         self.current_sloop_info = (loop_var, node)
         
         self.indent_level += 1
+        
+        # Check if this sloop contains nested accumulators that need initialization
+        nested_accumulators = self._find_nested_sloop_accumulators(body)
+        if nested_accumulators:
+            # Generate initialization code for nested accumulators
+            init_code = self._generate_nested_accumulator_init(nested_accumulators)
+            if init_code:
+                code += init_code
         
         body_code = self._generate_node(body)
         # Remove any leading/trailing newlines from body to avoid double newlines
@@ -2405,6 +2579,7 @@ def {kernel_name}(
         # Also check if this tensor is used with different index patterns in sloops
         is_cross_sloop_memory = (hasattr(self, 'cross_sloop_memory_tensors') and 
                                 tensor_name in self.cross_sloop_memory_tensors)
+        
         
         if (tensor_type == NodeType.OUTPUT or 
             tensor_type == NodeType.INPUT or 
