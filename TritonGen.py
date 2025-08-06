@@ -874,10 +874,18 @@ import torch
         
         # Identify accumulators among cross-kernel tensors
         all_accumulators = self._identify_accumulators(ast)
+
+        # For cross-kernel tensors, we need to check if they're actually being
+        # accumulated FROM ZERO in this kernel, not just modified
         for tensor in all_accumulators:
-            if (tensor in self.cross_kernel_tensors or 
-                tensor in self.cross_sloop_memory_tensors or
-                (tensor in self.output_tensors and tensor in self.intermediate_tensors)):
+            # Check if this tensor is loaded from memory before being stored
+            # If it's loaded from memory, it's not a kernel accumulator
+            if tensor in self.cross_kernel_tensors:
+                # Check if there's a load of this tensor in the kernel
+                if not self._tensor_is_loaded_before_store(ast, tensor):
+                    self.kernel_accumulators.add(tensor)
+            elif (tensor in self.cross_sloop_memory_tensors or
+                    (tensor in self.output_tensors and tensor in self.intermediate_tensors)):
                 self.kernel_accumulators.add(tensor)
         
         # Initialize kernel accumulators
@@ -1219,7 +1227,28 @@ import torch
                 code += f"{indent}{tensor_name} = tl.zeros({shape_str}, dtype=tl.float16)\n"
         
         return code
-    
+
+    def _tensor_is_loaded_before_store(self, ast: ASTNode, tensor_name: str) -> bool:
+        """Check if a tensor is loaded from memory before being stored (not a fresh accumulator)"""
+        def check_loads(node: ASTNode) -> bool:
+            if node.node_type == NodeType.LOAD:
+                # Check if this load is for our tensor
+                if len(node.children) >= 1:
+                    tensor_node = node.children[0]
+                    if tensor_node.node_type == NodeType.TENSOR:
+                        for child in tensor_node.children:
+                            if child.node_type == NodeType.VAR and child.value == tensor_name:
+                                return True
+
+            # Recursively check children
+            for child in node.children:
+                if isinstance(child, ASTNode):
+                    if check_loads(child):
+                        return True
+            return False
+
+        return check_loads(ast)
+
     def _identify_accumulators(self, ast: ASTNode) -> set:
         """Identify which intermediate tensors are accumulators"""
         accumulators = set()
