@@ -77,9 +77,6 @@ class TritonCodeGen:
         """Generate mask code for tensor access if needed
         Returns: (mask_code, mask_var_name or None)
         """
-        # Debug
-        # print(f"DEBUG: _generate_mask_for_index called for tensor={tensor_name}, index_children={[c.node_type for c in index_node.children]}")
-        
         # Collect tiles that need masking
         tiles_needing_mask = []
         
@@ -144,11 +141,9 @@ class TritonCodeGen:
             # If the existing mask is at the current scope level or higher (lower number), 
             # AND it's from the same loop instance (or no loop), reuse it
             if existing_scope <= self.indent_level and existing_loop_instance == self.current_loop_instance:
-                # print(f"DEBUG: Reusing existing mask {existing_mask_var} for key {mask_key}")
                 return "", existing_mask_var
             else:
                 # The mask was defined in a deeper scope or different loop instance, need to regenerate
-                # print(f"DEBUG: Mask {existing_mask_var} out of scope or different loop, regenerating")
                 pass
         
         # Generate new mask
@@ -564,10 +559,6 @@ import torch
         # This excludes local intermediate tensors that are allocated inside kernels
         forward_params = []
         
-        # Debug print to understand tensor classification
-        # print(f"DEBUG: all_tensors = {sorted(all_tensors)}")
-        # print(f"DEBUG: all_local_intermediate_tensors = {sorted(all_local_intermediate_tensors)}")
-        
         for tensor_name in sorted(all_tensors):
             # Exclude local intermediate tensors (allocated with tl.zeros inside kernels)
             if tensor_name not in all_local_intermediate_tensors:
@@ -607,36 +598,40 @@ import torch
                         kernel_block_params.append((loop_var, block_param))
             
             # Generate lambda expression for grid calculation
-            if parallel_dims and kernel_block_params:
-                # Build the lambda parameter list from the kernel's metadata
-                lambda_params = []
-                for loop_var, block_param in kernel_block_params:
-                    # Map block parameter to autotune parameter name
-                    lambda_params.append(f"BLOCK_{loop_var.upper()}")
-                
-                # Generate the grid calculation lambda
+            if parallel_dims:
+                # Check if we have any BLOCK parameters or all are constants
+                has_block_params = False
                 grid_lambda_parts = []
+                
                 for idx, (loop_var, start, end, tile_size) in enumerate(parallel_dims):
-                    # Find the corresponding BLOCK parameter
-                    block_var = None
-                    for lv, bp in kernel_block_params:
-                        if lv == loop_var:
-                            block_var = f'meta["BLOCK_{lv.upper()}"]'
-                            break
-                    
-                    if block_var:
-                        # Use the same end_param calculation as before
+                    # Check if tile_size is a fixed number or a BLOCK parameter
+                    if isinstance(tile_size, str) and tile_size.isdigit():
+                        # Fixed tile size (e.g., "64")
                         end_param = end
-                        # ... (keep the existing end_param calculation logic) ...
-                        if end in ['M', 'N', 'K', 'P'] or (isinstance(end, str) and end.isalpha()):
-                            # Use the constant value directly
-                            end_param = end
+                        grid_lambda_parts.append(f"({end_param} - {start} + {tile_size} - 1) // {tile_size}")
+                    else:
+                        # This is a BLOCK parameter
+                        has_block_params = True
+                        # Find the corresponding BLOCK parameter
+                        block_var = None
+                        for lv, bp in kernel_block_params:
+                            if lv == loop_var:
+                                block_var = f'meta["BLOCK_{lv.upper()}"]'
+                                break
                         
-                        grid_lambda_parts.append(f"({end_param} - {start} + {block_var} - 1) // {block_var}")
+                        if block_var:
+                            # Use the same end_param calculation as before
+                            end_param = end
+                            grid_lambda_parts.append(f"({end_param} - {start} + {block_var} - 1) // {block_var}")
                 
                 if grid_lambda_parts:
-                    lambda_expr = f"lambda meta: ({', '.join(grid_lambda_parts)},)"
-                    code += f"    {kernel_name}[{lambda_expr}](\n"
+                    if has_block_params:
+                        # Need lambda for BLOCK parameters
+                        lambda_expr = f"lambda meta: ({', '.join(grid_lambda_parts)},)"
+                        code += f"    {kernel_name}[{lambda_expr}](\n"
+                    else:
+                        # All constants, no need for lambda
+                        code += f"    {kernel_name}[({', '.join(grid_lambda_parts)},)](\n"
                 else:
                     code += f"    {kernel_name}[(1,)](\n"
             else:
@@ -2475,12 +2470,10 @@ def {kernel_name}(
         # Generate mask if needed
         mask_code, mask_var = self._generate_mask_for_index(index_node, tensor_name)
         if mask_var:  # Check if mask_var exists, not just mask_code
-            # print(f"DEBUG: Adding mask to load for {tensor_name}, mask_var={mask_var}")
             if mask_code:
                 code += mask_code
             code += f"{indent_str}{var_name} = tl.load({tensor_name}_ptr + {offset_var}, mask={mask_var}, other=0.0)"
         else:
-            # print(f"DEBUG: No mask needed for load of {tensor_name}")
             code += f"{indent_str}{var_name} = tl.load({tensor_name}_ptr + {offset_var})"
         
         # No need for expand_dims anymore - proper offset calculation handles all dimensions
@@ -2625,11 +2618,16 @@ def {kernel_name}(
                     raise ValueError(f"Expected temp_var for {child.node_type} node")
                 
                 # Get permutation dimensions
-                dim0 = self._generate_node(val_node.children[1])
-                dim1 = self._generate_node(val_node.children[2])
-                dim2 = self._generate_node(val_node.children[3])
-                
-                value_expr = f"tl.permute({tensor_expr}, ({dim0}, {dim1}, {dim2}))"
+                # dim0 = self._generate_node(val_node.children[1])
+                # dim1 = self._generate_node(val_node.children[2])
+                # dim2 = self._generate_node(val_node.children[3])
+                # dim3 = self._generate_node(val_node.children[4])
+                perm_strs = []
+                for i in range(len(val_node.children)-1):
+                    dim = self._generate_node(val_node.children[i+1])
+                    perm_strs.append(str(dim))
+                perm_str = f"({', '.join(perm_strs)})"
+                value_expr = f"tl.permute({tensor_expr}, {perm_str})"
             
             elif val_node.node_type == NodeType.UNSQUEEZE:
                 child = val_node.children[0]
@@ -2787,12 +2785,10 @@ def {kernel_name}(
             # Generate mask if needed for store
             mask_code, mask_var = self._generate_mask_for_index(index_node, tensor_name)
             if mask_var:  # Check if mask_var exists, not just mask_code
-                # print(f"DEBUG: Adding mask to store for {tensor_name}, mask_var={mask_var}")
                 if mask_code:
                     code += mask_code
                 code += f"{indent_str}tl.store({tensor_name}_ptr + {offset_var}, {value_expr}, mask={mask_var})"
             else:
-                # print(f"DEBUG: No mask needed for store of {tensor_name}")
                 code += f"{indent_str}tl.store({tensor_name}_ptr + {offset_var}, {value_expr})"
         else:
             # For intermediate tensors (pre-allocated with tl.zeros), use direct assignment
@@ -2957,14 +2953,17 @@ def {kernel_name}(
                     for i in range(len(offsets)):
                         if i == dim:
                             nones.append(":")
-                        elif not is_scalar[i]:
+                        else:
                             nones.append("None")
                     
-                    if len([n for n in nones if n == ":"]) == 1 and len([n for n in nones if n == "None"]) == 0:
-                        # Only one dimension, no broadcasting needed
+                    # Count non-scalar dimensions
+                    array_dims = sum(1 for i, s in enumerate(is_scalar) if not s)
+                    
+                    if array_dims == 1:
+                        # Only one array dimension, no broadcasting needed
                         offset_parts.append(f"({off}){stride_term}")
                     else:
-                        # Need broadcasting
+                        # Need broadcasting for multiple array dimensions
                         broadcast_expr = "[" + ", ".join(nones) + "]"
                         offset_parts.append(f"({off}){broadcast_expr}{stride_term}")
             
@@ -3620,22 +3619,34 @@ def {kernel_name}(
             raise ValueError(f"Expected temp_var for {child.node_type} node in permute3")
         
         # Get the permutation dimensions based on number of children
-        if len(node.children) == 4:
-            # 3D permutation
-            dim0 = self._generate_node(node.children[1])
-            dim1 = self._generate_node(node.children[2])
-            dim2 = self._generate_node(node.children[3])
-            perm_dims = (int(dim0), int(dim1), int(dim2))
-            perm_str = f"({dim0}, {dim1}, {dim2})"
-        else:
-            # 4D permutation
-            dim0 = self._generate_node(node.children[1])
-            dim1 = self._generate_node(node.children[2])
-            dim2 = self._generate_node(node.children[3])
-            dim3 = self._generate_node(node.children[4])
-            perm_dims = (int(dim0), int(dim1), int(dim2), int(dim3))
-            perm_str = f"({dim0}, {dim1}, {dim2}, {dim3})"
+        # if len(node.children) == 4:
+        #     # 3D permutation
+        #     dim0 = self._generate_node(node.children[1])
+        #     dim1 = self._generate_node(node.children[2])
+        #     dim2 = self._generate_node(node.children[3])
+        #     perm_dims = (int(dim0), int(dim1), int(dim2))
+        #     perm_str = f"({dim0}, {dim1}, {dim2})"
+        # else:
+        #     # 4D permutation
+        #     dim0 = self._generate_node(node.children[1])
+        #     dim1 = self._generate_node(node.children[2])
+        #     dim2 = self._generate_node(node.children[3])
+        #     dim3 = self._generate_node(node.children[4])
+        #     perm_dims = (int(dim0), int(dim1), int(dim2), int(dim3))
+        #     perm_str = f"({dim0}, {dim1}, {dim2}, {dim3})"
+
+        # Dynamic permutation dimensions
+        perm_dims = []
+        perm_strs = []
+
+        for i in range(len(node.children)-1):  # Skip the first child (tensor)
+            dim = self._generate_node(node.children[i + 1])
+            perm_dims.append(int(dim))
+            perm_strs.append(str(dim))
         
+        perm_dims = tuple(perm_dims)
+        perm_str = f"({', '.join(perm_strs)})"
+
         # If used inline (e.g., in a store), return the expression directly
         if hasattr(self, '_generating_inline') and self._generating_inline:
             return f"tl.permute({tensor_expr}, {perm_str})"
@@ -3743,6 +3754,9 @@ def {kernel_name}(
         # Store temp var in node for parent operations
         node.temp_var = temp_var
         
+        # Store squeeze dimension for parent operations
+        node.squeeze_dim = int(dim)
+        
         return code
     
     def _infer_tensor_name(self, node: ASTNode) -> str:
@@ -3793,12 +3807,6 @@ def {kernel_name}(
         # Get the tensor expression
         if hasattr(child, 'temp_var'):
             tensor_expr = child.temp_var
-        # else:
-        #     # For simple expressions like identifiers, evaluate inline
-        #     if child.node_type == NodeType.IDENTIFIER:
-        #         tensor_expr = child.value
-        #     else:
-        #         raise ValueError(f"Expected temp_var for {child.node_type} node in unsqueeze")
         
         # Get the dimension to unsqueeze
         dim = self._generate_node(node.children[1])
@@ -3814,5 +3822,8 @@ def {kernel_name}(
         
         # Store temp var in node for parent operations
         node.temp_var = temp_var
+        
+        # Store unsqueeze dimension for parent operations
+        node.unsqueeze_dim = int(dim)
         
         return code
