@@ -924,7 +924,21 @@ import torch
     
     def _collect_intermediate_tensors(self, node: ASTNode, in_ploop=False, ploop_var=None):
         """Collect intermediate tensors (tensor operators used in store operations)"""
-        if node.node_type == NodeType.STORE:
+        # Also process LOAD nodes to capture index patterns for kernel accumulators
+        if node.node_type == NodeType.LOAD:
+            tensor_node = node.children[0] if node.children else None
+            if tensor_node and tensor_node.node_type == NodeType.TENSOR:
+                for child in tensor_node.children:
+                    if child.node_type == NodeType.VAR:
+                        tensor_name = child.value
+                        # Record index pattern for tensors that might be kernel accumulators
+                        if len(node.children) >= 2:
+                            index_node = node.children[1]
+                            if index_node.node_type == NodeType.INDEX:
+                                # Store the index pattern if we don't have it yet
+                                if tensor_name not in self.intermediate_tensor_indices:
+                                    self.intermediate_tensor_indices[tensor_name] = index_node
+        elif node.node_type == NodeType.STORE:
             tensor_node = node.children[0]
             if tensor_node.node_type == NodeType.TENSOR:
                 # Handle multiple tensor names (comma-separated)
@@ -1116,8 +1130,9 @@ import torch
         
         return False
     
-    def _find_nested_sloop_accumulators(self, ast: ASTNode) -> set:
-        """Find accumulators that are used in nested sloops within this AST"""
+    def _find_nested_sloop_accumulators(self, ast: ASTNode, loop_var: str = None) -> set:
+        """Find accumulators that are used in nested sloops within this AST
+        If loop_var is provided, only return accumulators whose indices use that loop variable"""
         accumulators = set()
         
         def find_in_sloop(node: ASTNode, in_nested: bool = False, depth: int = 0):
@@ -1127,6 +1142,7 @@ import torch
             elif node.node_type == NodeType.STORE and in_nested:
                 tensor_node = node.children[0]
                 val_node = node.children[1]
+                index_node = node.children[2] if len(node.children) > 2 else None
                 
                 if tensor_node.node_type in [NodeType.INPUT, NodeType.OUTPUT, NodeType.TENSOR]:
                     for child in tensor_node.children:
@@ -1137,7 +1153,19 @@ import torch
                                 if self._is_accumulation_pattern(val_node, tensor_name):
                                     # Check if this tensor is a kernel accumulator
                                     if tensor_name in self.kernel_accumulators:
-                                        accumulators.add(tensor_name)
+                                        # If loop_var is specified, check if the index uses it
+                                        if loop_var and index_node:
+                                            # Check if this tensor's index uses the specified loop variable
+                                            uses_loop_var = False
+                                            for idx_child in index_node.children:
+                                                if self._index_uses_loop_var(idx_child, loop_var):
+                                                    uses_loop_var = True
+                                                    break
+                                            if uses_loop_var:
+                                                accumulators.add(tensor_name)
+                                        elif not loop_var:
+                                            # No specific loop var required, add all accumulators
+                                            accumulators.add(tensor_name)
             else:
                 # Continue traversing
                 for child in node.children:
@@ -1352,6 +1380,9 @@ import torch
                         # Tile dimension - use BLOCK_<var>
                         tile_var = idx_child.children[0].value
                         actual_shape_dims.append(f"BLOCK_{tile_var.upper()}")
+                    elif idx_child.node_type == NodeType.ELEM:
+                        # Element dimension - single element, size 1
+                        actual_shape_dims.append("1")
                 
                 # Generate initialization with the actual dimensions
                 shape_str = ", ".join(actual_shape_dims)
@@ -1542,7 +1573,21 @@ import torch
         """Identify tensors that need memory storage due to different index patterns across any loops"""
         memory_tensors = set()
         tensor_index_patterns = {}  # tensor_name -> {loop_id -> {patterns}}
+        tensor_sloop_vars = {}  # tensor_name -> set of sloop variables used in indices
         loop_counter = [0]
+        sloop_vars = set()  # Track all sloop variables
+        
+        # First, collect all sloop variables
+        def collect_sloop_vars(node: ASTNode):
+            if node.node_type == NodeType.SLOOP:
+                # Extract loop variable from sloop node
+                loop_var = node.children[3].value
+                sloop_vars.add(loop_var)
+            for child in node.children:
+                if isinstance(child, ASTNode):
+                    collect_sloop_vars(child)
+        
+        collect_sloop_vars(ast)
         
         def extract_index_pattern(index_node: ASTNode) -> str:
             """Extract a simplified representation of index pattern"""
@@ -1615,6 +1660,16 @@ import torch
                                 if loop_id not in tensor_index_patterns[tensor_name]:
                                     tensor_index_patterns[tensor_name][loop_id] = set()
                                 tensor_index_patterns[tensor_name][loop_id].add(pattern)
+                                
+                                # Track which sloop variables are used by this tensor
+                                if tensor_name not in tensor_sloop_vars:
+                                    tensor_sloop_vars[tensor_name] = set()
+                                
+                                # Check if index uses any sloop variables
+                                for idx_child in index_node.children:
+                                    for sloop_var in sloop_vars:
+                                        if self._index_uses_loop_var(idx_child, sloop_var):
+                                            tensor_sloop_vars[tensor_name].add(sloop_var)
                 
                 # Continue traversing
                 for child in node.children:
@@ -1655,9 +1710,17 @@ import torch
         accumulators = self._identify_accumulators(ast)
         
         # Add cross-sloop tensors to memory tensors
-        # EXCEPT those that only use fulltile indices (like attn_O3)
+        # BUT ONLY if they actually use sloop variables in their indices
         for tensor_name in cross_sloop_tensors:
             if tensor_name in self.intermediate_tensors:
+                # Check if this tensor uses any sloop variables
+                uses_sloop_var = tensor_name in tensor_sloop_vars and len(tensor_sloop_vars[tensor_name]) > 0
+                
+                if not uses_sloop_var:
+                    # This tensor doesn't use any sloop variables, so it's not really cross-sloop
+                    # Examples: Q1, K1, V1 with index pattern (fulltile, tile_n) where n is ploop var
+                    continue
+                
                 # Check if this tensor only uses fulltile indices
                 if tensor_name in tensor_index_patterns:
                     all_patterns = set()
@@ -2299,7 +2362,8 @@ def {kernel_name}(
         self.sloop_depth += 1  # Increment sloop depth
         
         # Check if this sloop contains nested accumulators that need initialization
-        nested_accumulators = self._find_nested_sloop_accumulators(body)
+        # Pass the loop variable to only get accumulators that use this specific loop var
+        nested_accumulators = self._find_nested_sloop_accumulators(body, loop_var)
         
         # Temporarily remove nested accumulators from cross_sloop_memory_tensors
         # so they accumulate in registers inside this loop
@@ -2888,34 +2952,25 @@ def {kernel_name}(
                 padded_dim, needs_padding = self._get_padded_block_size(fulltile_dim)
                 offsets.append(f"tl.arange(0, {padded_dim})")
             elif child.node_type == NodeType.ELEM:
-                # For elem indexing, use the loop variable directly without creating a range
+                # For elem indexing
                 # (elem n) means use n as a scalar index
                 if child.children:
                     elem_var = child.children[0].value
-                    # Check if this dimension has size 1 in the tensor shape
-                    needs_arange = False
+                    # Always check the actual dimension size in tensor shape
+                    dim_size = None
                     if tensor_name in self.tensor_shapes:
                         shape = self.tensor_shapes[tensor_name]
                         if i < len(shape):
                             dim_value = shape[i]
-                            # Resolve the dimension value to check if it's 1
-                            resolved_dim = self.resolve_value(dim_value)
-                            if resolved_dim == "1" or resolved_dim == 1:
-                                needs_arange = True
-                            # Also check for 3D tensors' first dimension (batch/head dimension)
-                            elif len(shape) == 3 and i == 0:
-                                needs_arange = True
+                            # Resolve the dimension value
+                            dim_size = self.resolve_value(dim_value)
+                            if isinstance(dim_size, str) and dim_size.isdigit():
+                                dim_size = int(dim_size)
                     
-                    if needs_arange:
-                        # For dimensions with size 1 or batch dimension in 3D tensors
-                        # Use tl.arange(0, 1) to maintain tensor dimensionality
-                        block_param = f"BLOCK_{elem_var.upper()}"
-                        offsets.append(f"({elem_var}//{block_param})+tl.arange(0, 1)")
-                    else:
-                        # Divide by tile size to get actual dimension index
-                        # elem n with ploop means n can be 0, 64, 128, ... so we need n//BLOCK_N
-                        block_param = f"BLOCK_{elem_var.upper()}"
-                        offsets.append(f"({elem_var} // {block_param})")
+                    # ELEM always needs tl.arange(0, 1) to maintain tensor dimensionality
+                    # Each kernel instance processes only one element in this dimension
+                    block_param = f"BLOCK_{elem_var.upper()}"
+                    offsets.append(f"(({elem_var} // {block_param})+tl.arange(0, 1))")
             elif child.node_type == NodeType.CONST_TILE:
                 # For const_tile, create a range from start to start+size
                 # (const_tile start size) means [start:start+size]
