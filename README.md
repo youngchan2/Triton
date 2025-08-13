@@ -19,4 +19,18 @@
     - [x] Determine how to apply the tensor information with external file   
     - [x] Evaluation for the various computation  
     - [x] Handle multiple tensors in one `input`&`tensor` operators.
-    - [ ] Determine how to apply mixed precision
+4. Evaluation
+    - Vanilla
+    - PreNorm
+    - QKNorm
+    - KeyFormer
+    - RoCo
+5. Model Configuration
+    - Falcon 7B
+    - Llama3 8B
+6. Target Hardware
+    - H100
+    - A100
+    - A40
+    - RTX5090
+    - RTX4090

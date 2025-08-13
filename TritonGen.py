@@ -131,7 +131,8 @@ class TritonCodeGen:
         mask_conditions = []
         
         # Check if we've already generated this mask combination
-        mask_key = tuple((loop_var, dim_idx) for loop_var, dim_idx, _, _ in tiles_needing_mask)
+        # Include tensor name in the key to avoid reusing masks for different tensors
+        mask_key = (tensor_name,) + tuple((loop_var, dim_idx) for loop_var, dim_idx, _, _ in tiles_needing_mask)
         if mask_key in self.generated_masks:
             # Check if the mask was defined at a higher or equal scope level
             existing_mask_var = self.generated_masks[mask_key]
