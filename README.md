@@ -1,36 +1,39 @@
-# Triton
-1. Data Structure
-    - NodeType: Type of Operation
-    - AstNode: Data class for AST
-2. Helper Function
-    - IrParser: Convert IR to AST
-    - TritonGen: Generate triton kernel with the outcome of IrParser
-3. Check List
+# Trinity: Three-Dimensional Tensor Optimization via Tile-level Equality Saturation
+
+## 1. Data Structure
+    - **NodeType**: Represent the type of operation in the IR
+    - **AstNode**: Data class for representing the AST (Abstract Syntax Tree)
+## 2. Helper Function
+    - **IrParser**: Convert IR into AST format
+    - **TritonGen**: Generate Triton kernel based on the parsed AST
+## 3. Development Check List
     - [x] For `tl.dot` in `matmul`, `allow_tf32` should be `True`  
-            (To check the result, `allow_tf32` shoudl be `False`)
-    - [x] Add `elem`, `bcast`, `concat`, `dummy`,`permute3`, `squeeze`, `unsqueeze`, `const_tile`
-    - [x] Problem with `for` loop for `fulltile fulltile` index  
-    - [x] Add `kernel` caller (Need different grid for `ploop` and `sloop`)   
-            (Using `forward` to call kernel)
-    - [x] Handle with cross-kernel tensors with `tl.store`   
-            (Add condition for using `tl.store`)
-    - [x] Determine which intermediate tensors should be initialized with `tl.zeros`  
-    - [x] Need to optimize the number of argument of kernel   
-    - [x] Determine how to apply the tensor information with external file   
-    - [x] Evaluation for the various computation  
+        - Enable `allow_tf32` for performance. 
+        - Disable `allow_tf32` to verify correctness
+    - [x] Add operator support: `elem`, `bcast`, `concat`, `dummy`,`permute3`, `squeeze`, `unsqueeze`, `const_tile`, `sigmoid`, `sqrt`, `rsqrt`
+    - [x] Fix indexing issue for nested `for` loops in `fulltile fulltile`  
+    - [x] Add kernel caller with different grid configs for `ploop` and `sloop`  
+        - Use `forward` to invoke the kernel
+    - [x] Distinguish between on-chip and off-chip tensors to optimize memory usage and performance
+        - Support cross-kernel tensors with `tl.store`  
+        - Add condition to determine when `tl.store` is used
+    - [x] Decide which intermediate tensors should be initialized with `tl.zeros`  
+    - [x] Optimize the number of argument of kernel   
+    - [x] Support applying tensor metadata from external files
+    - [x] Add Evaluation for the various computation  
     - [x] Handle multiple tensors in one `input`&`tensor` operators.
-4. Evaluation
-    - Vanilla
-    - PreNorm
-    - QKNorm
-    - KeyFormer
-    - RoCo
-5. Model Configuration
-    - Falcon 7B
-    - Llama3 8B
-6. Target Hardware
-    - H100
-    - A100
-    - A40
-    - RTX5090
-    - RTX4090
+## 4. Evaluation
+    - **Vanilla**
+    - **PreNorm**
+    - **QKNorm**
+    - **KeyFormer**
+    - **RoCo**
+## 5. Model Configuration
+    - **Falcon 7B**
+    - **Llama3 8B**
+## 6. Target Hardware
+    - NVIDIA H100
+    - NVIDIA A100
+    - NVIDIA A40
+    - NVIDIA RTX5090
+    - NVIDIA RTX4090
