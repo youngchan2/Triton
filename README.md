@@ -1,11 +1,11 @@
 # Trinity: Three-Dimensional Tensor Optimization via Tile-level Equality Saturation
 
 ## 1. Data Structure
-    - **NodeType**: Represent the type of operation in the IR
-    - **AstNode**: Data class for representing the AST (Abstract Syntax Tree)
+    - NodeType: Represent the type of operation in the IR
+    - AstNode: Data class for representing the AST (Abstract Syntax Tree)
 ## 2. Helper Function
-    - **IrParser**: Convert IR into AST format
-    - **TritonGen**: Generate Triton kernel based on the parsed AST
+    - IrParser: Convert IR into AST format
+    - TritonGen: Generate Triton kernel based on the parsed AST
 ## 3. Development Check List
     - [x] For `tl.dot` in `matmul`, `allow_tf32` should be `True`  
         - Enable `allow_tf32` for performance. 
@@ -23,14 +23,14 @@
     - [x] Add Evaluation for the various computation  
     - [x] Handle multiple tensors in one `input`&`tensor` operators.
 ## 4. Evaluation
-    - **Vanilla**
-    - **PreNorm**
-    - **QKNorm**
-    - **KeyFormer**
-    - **RoCo**
+    - Vanilla
+    - PreNorm
+    - QKNorm
+    - KeyFormer
+    - RoCo
 ## 5. Model Configuration
-    - **Falcon 7B**
-    - **Llama3 8B**
+    - Falcon 7B
+    - Llama3 8B
 ## 6. Target Hardware
     - NVIDIA H100
     - NVIDIA A100
